@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+mev-data = { path = "../mev-data" }
 alloy.workspace = true
 revm.workspace = true
 arrow.workspace = true
