@@ -10,6 +10,7 @@ use indicatif::ProgressBar;
 use std::path::{Path, PathBuf};
 use tokio::io::AsyncWriteExt;
 
+use crate::store::Store;
 use crate::types::MempoolTransaction;
 
 /// Download a single day's mempool-dumpster Parquet file from Flashbots.
@@ -293,7 +294,64 @@ pub fn parse_parquet(path: &Path) -> Result<Vec<MempoolTransaction>> {
     Ok(txs)
 }
 
+/// Filter mempool transactions to keep only those with block_number in range.
+///
+/// Retains transactions where `block_number` is `Some` and falls within
+/// the inclusive range `start..=end`.
+///
+/// # Arguments
+/// * `txs` - Vector of transactions to filter
+/// * `start` - Start of inclusive block number range
+/// * `end` - End of inclusive block number range
+///
+/// # Returns
+/// Filtered vector containing only in-range transactions
+pub fn filter_by_block_range(
+    txs: Vec<MempoolTransaction>,
+    start: u64,
+    end: u64,
+) -> Vec<MempoolTransaction> {
+    txs.into_iter()
+        .filter(|tx| tx.block_number.is_some_and(|bn| bn >= start && bn <= end))
+        .collect()
+}
+
+/// Download, parse, and store a day's mempool transactions.
+///
+/// Orchestrates the full workflow: download Parquet file from Flashbots,
+/// parse into MempoolTransaction structs, and insert into SQLite.
+///
+/// # Arguments
+/// * `date` - Date in NaiveDate format (e.g., 2025-02-22)
+/// * `store` - SQLite Store for persistence
+/// * `data_dir` - Directory for cached Parquet files
+///
+/// # Returns
+/// Count of transactions inserted into database
+///
+/// # Errors
+/// Returns error if download fails, parsing fails, or database insert fails.
+#[tracing::instrument(skip(store), fields(date = %date))]
+pub async fn download_and_store(date: NaiveDate, store: &Store, data_dir: &Path) -> Result<usize> {
+    // Download or retrieve cached Parquet file
+    let path = download_day(date, data_dir).await?;
+
+    // Parse Parquet into transaction structs
+    let txs = parse_parquet(&path)?;
+    tracing::debug!(tx_count = txs.len(), "parsed transactions from parquet");
+
+    // Insert into database
+    let inserted = store.insert_mempool_txs(&txs)?;
+    tracing::info!(
+        inserted_count = inserted,
+        "inserted transactions into database"
+    );
+
+    Ok(inserted)
+}
+
 #[cfg(test)]
+#[allow(unused_imports)]
 mod tests {
     use super::*;
     use arrow::array::{ArrayRef, StringBuilder, UInt32Builder, UInt64Builder};
@@ -477,5 +535,102 @@ mod tests {
             txs[1].max_priority_fee_per_gas, "2000000000",
             "EIP1559 fees should be parsed"
         );
+    }
+
+    #[test]
+    fn filter_by_block_range_keeps_only_in_range() {
+        let txs = vec![
+            // Tx 0: block 99 (before range)
+            MempoolTransaction {
+                hash: "0x01".to_string(),
+                block_number: Some(99),
+                timestamp_ms: 1000,
+                from_address: "0xfrom".to_string(),
+                to_address: Some("0xto".to_string()),
+                value: "100".to_string(),
+                gas_limit: 21000,
+                gas_price: "20000000000".to_string(),
+                max_fee_per_gas: "0".to_string(),
+                max_priority_fee_per_gas: "0".to_string(),
+                nonce: 0,
+                input_data: "0x".to_string(),
+                tx_type: 0,
+                raw_tx: "0x".to_string(),
+            },
+            // Tx 1: block 100 (in range) ✓
+            MempoolTransaction {
+                hash: "0x02".to_string(),
+                block_number: Some(100),
+                timestamp_ms: 1001,
+                from_address: "0xfrom".to_string(),
+                to_address: None,
+                value: "200".to_string(),
+                gas_limit: 21000,
+                gas_price: "20000000000".to_string(),
+                max_fee_per_gas: "0".to_string(),
+                max_priority_fee_per_gas: "0".to_string(),
+                nonce: 1,
+                input_data: "0x".to_string(),
+                tx_type: 0,
+                raw_tx: "0x".to_string(),
+            },
+            // Tx 2: block 102 (in range) ✓
+            MempoolTransaction {
+                hash: "0x03".to_string(),
+                block_number: Some(102),
+                timestamp_ms: 1002,
+                from_address: "0xfrom".to_string(),
+                to_address: Some("0xto".to_string()),
+                value: "300".to_string(),
+                gas_limit: 21000,
+                gas_price: "20000000000".to_string(),
+                max_fee_per_gas: "0".to_string(),
+                max_priority_fee_per_gas: "0".to_string(),
+                nonce: 2,
+                input_data: "0x".to_string(),
+                tx_type: 0,
+                raw_tx: "0x".to_string(),
+            },
+            // Tx 3: NULL block_number (no block, excluded)
+            MempoolTransaction {
+                hash: "0x04".to_string(),
+                block_number: None,
+                timestamp_ms: 1003,
+                from_address: "0xfrom".to_string(),
+                to_address: Some("0xto".to_string()),
+                value: "400".to_string(),
+                gas_limit: 21000,
+                gas_price: "20000000000".to_string(),
+                max_fee_per_gas: "0".to_string(),
+                max_priority_fee_per_gas: "0".to_string(),
+                nonce: 3,
+                input_data: "0x".to_string(),
+                tx_type: 0,
+                raw_tx: "0x".to_string(),
+            },
+            // Tx 4: block 103 (after range)
+            MempoolTransaction {
+                hash: "0x05".to_string(),
+                block_number: Some(103),
+                timestamp_ms: 1004,
+                from_address: "0xfrom".to_string(),
+                to_address: Some("0xto".to_string()),
+                value: "500".to_string(),
+                gas_limit: 21000,
+                gas_price: "20000000000".to_string(),
+                max_fee_per_gas: "0".to_string(),
+                max_priority_fee_per_gas: "0".to_string(),
+                nonce: 4,
+                input_data: "0x".to_string(),
+                tx_type: 0,
+                raw_tx: "0x".to_string(),
+            },
+        ];
+
+        let filtered = filter_by_block_range(txs, 100, 102);
+
+        assert_eq!(filtered.len(), 2, "should keep 2 transactions in range");
+        assert_eq!(filtered[0].hash, "0x02", "first kept tx has block 100");
+        assert_eq!(filtered[1].hash, "0x03", "second kept tx has block 102");
     }
 }
