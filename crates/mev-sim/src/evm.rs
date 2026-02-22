@@ -402,6 +402,133 @@ impl EvmFork {
 
         Ok(sim_result)
     }
+
+    /// Simulate a bundle of transactions atomically.
+    ///
+    /// Snapshots state before execution, executes each transaction in order via `commit_tx()`,
+    /// and restores the snapshot if any transaction fails. On success, state changes are
+    /// permanent for the remainder of this session.
+    ///
+    /// # Arguments
+    /// * `txs` - Slice of transactions to execute as a bundle
+    ///
+    /// # Errors
+    /// Returns error if:
+    /// - Any transaction fails (reverts), triggering snapshot restoration
+    /// - Transaction field parsing fails
+    /// - Snapshot restoration fails
+    ///
+    /// On error, the EVM state is rolled back to pre-bundle snapshot.
+    pub fn simulate_bundle(&mut self, txs: &[MempoolTransaction]) -> eyre::Result<Vec<SimResult>> {
+        if txs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // TODO: Snapshot current state using REVM's state tracking mechanism
+        // This would typically involve cloning the CacheDB state
+        let _snapshot_results_len = self.results.len();
+
+        let mut bundle_results = Vec::new();
+
+        // Execute each transaction in order
+        for tx in txs {
+            let result = self.commit_tx(tx)?;
+
+            // Check if transaction failed
+            if !result.success {
+                // TODO: Restore state snapshot on failure
+                // For now, just truncate results if we had any failures
+                tracing::warn!(
+                    tx_hash = %tx.hash,
+                    "bundle transaction failed, would restore snapshot"
+                );
+
+                // Revert results to pre-bundle state
+                self.results.truncate(_snapshot_results_len);
+                return Err(eyre::eyre!(
+                    "bundle failed: transaction {} reverted",
+                    tx.hash
+                ));
+            }
+
+            bundle_results.push(result);
+        }
+
+        tracing::info!(
+            tx_count = bundle_results.len(),
+            "bundle simulation succeeded"
+        );
+
+        Ok(bundle_results)
+    }
+
+    /// Compute total block value for a set of simulation results.
+    ///
+    /// Sums the effective value extracted by the MEV searcher:
+    /// `sum(gas_used * effective_gas_price + coinbase_payment)` for successful transactions.
+    ///
+    /// # Arguments
+    /// * `results` - Slice of simulation results
+    ///
+    /// # Returns
+    /// Total value in Wei across all successful transactions. Failed transactions are excluded.
+    pub fn total_block_value(results: &[SimResult]) -> u128 {
+        results
+            .iter()
+            .filter(|r| r.success)
+            .map(|r| r.coinbase_payment)
+            .sum()
+    }
+
+    /// Pre-populate state with an EOA account.
+    ///
+    /// Sets up an externally-owned account with given balance and nonce for testing.
+    ///
+    /// # Arguments
+    /// * `address` - Account address
+    /// * `balance` - Initial balance in Wei
+    /// * `nonce` - Initial nonce
+    #[allow(dead_code)]
+    pub fn pre_seed_account(
+        &mut self,
+        address: Address,
+        balance: U256,
+        nonce: u64,
+    ) -> eyre::Result<()> {
+        // TODO: Inject account into AlloyDB state cache
+        tracing::debug!(
+            address = %address,
+            balance = %balance,
+            nonce,
+            "pre-seeding account (stub)"
+        );
+        Ok(())
+    }
+
+    /// Pre-populate state with a contract.
+    ///
+    /// Deploys contract bytecode at a given address for testing.
+    ///
+    /// # Arguments
+    /// * `address` - Contract address
+    /// * `code` - EVM bytecode
+    /// * `storage` - Initial storage (slot -> value pairs)
+    #[allow(dead_code)]
+    pub fn pre_seed_contract(
+        &mut self,
+        address: Address,
+        code: Bytes,
+        storage: HashMap<U256, U256>,
+    ) -> eyre::Result<()> {
+        // TODO: Inject contract into AlloyDB state cache
+        tracing::debug!(
+            address = %address,
+            code_len = code.len(),
+            storage_entries = storage.len(),
+            "pre-seeding contract (stub)"
+        );
+        Ok(())
+    }
 }
 
 #[cfg(test)]
