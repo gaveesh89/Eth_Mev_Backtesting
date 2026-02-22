@@ -3,12 +3,12 @@
 //! Uses pre-seeded in-memory state (no real RPC) for reproducible performance testing.
 //! Run with: `cargo bench --package mev-sim`
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use mev_data::types::MempoolTransaction;
-use mev_sim::ordering::{order_by_egp, apply_nonce_constraints};
-use mev_sim::strategies::arbitrage::{detect_v2_arb_opportunity, PoolState};
-use mev_analysis::pnl::format_eth;
 use alloy::primitives::address;
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use mev_analysis::pnl::format_eth;
+use mev_data::types::MempoolTransaction;
+use mev_sim::ordering::{apply_nonce_constraints, order_by_egp};
+use mev_sim::strategies::arbitrage::{detect_v2_arb_opportunity, PoolState};
 
 /// Generates a sample MempoolTransaction with given hash and gas price.
 fn sample_tx(hash_suffix: u64, gas_price: u128) -> MempoolTransaction {
@@ -23,7 +23,7 @@ fn sample_tx(hash_suffix: u64, gas_price: u128) -> MempoolTransaction {
         gas_price: format!("0x{:x}", gas_price),
         max_fee_per_gas: "0x0".to_string(),
         max_priority_fee_per_gas: "0x0".to_string(),
-        nonce: (hash_suffix / 100) as u64,
+        nonce: hash_suffix / 100,
         input_data: "0x".to_string(),
         tx_type: 0,
         raw_tx: "0xf86a8085012a05f20082520894d8da6bf26964af9d7eed9e03e53415d37aa96045880de0b6b3a764000080".to_string(),
@@ -44,7 +44,8 @@ fn sample_pool(address_suffix: u8, reserve0: u128, reserve1: u128) -> PoolState 
 
 /// Helper to parse address from string.
 fn address(s: &str) -> alloy::primitives::Address {
-    s.parse().unwrap_or_else(|_| alloy::primitives::address!("0000000000000000000000000000000000000000"))
+    s.parse()
+        .unwrap_or_else(|_| alloy::primitives::address!("0000000000000000000000000000000000000000"))
 }
 
 /// Benchmark: Order 100 transactions by effective gas price.
