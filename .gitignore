@@ -1,0 +1,22 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Cargo lockfile (libraries)
+Cargo.lock
+
+# macOS
+.DS_Store
+
+# IDE/editor
+.idea/
+.vscode/*.code-workspace
+
+# Environment
+.env
+.env.*
+
+# Data snapshots
+data/*.db
+data/*.sqlite
+data/*.sqlite3

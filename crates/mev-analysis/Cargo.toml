@@ -1,0 +1,25 @@
+[package]
+name = "mev-analysis"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+alloy.workspace = true
+revm.workspace = true
+arrow.workspace = true
+parquet.workspace = true
+rusqlite.workspace = true
+tokio.workspace = true
+clap.workspace = true
+serde.workspace = true
+eyre.workspace = true
+color-eyre.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+reqwest.workspace = true
+chrono.workspace = true
+comfy-table.workspace = true
+indicatif.workspace = true
+criterion.workspace = true
+dashmap.workspace = true
