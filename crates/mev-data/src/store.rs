@@ -449,13 +449,13 @@ impl Store {
         let mut stmt =
             conn.prepare("SELECT MIN(block_number), MAX(block_number), COUNT(*) FROM blocks")?;
 
-        let (min_block, max_block, count): (i64, i64, i64) =
+        let (min_block, max_block, count): (Option<i64>, Option<i64>, i64) =
             stmt.query_row([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
 
         Ok((
-            if min_block > 0 { min_block as u64 } else { 0 },
-            if max_block > 0 { max_block as u64 } else { 0 },
-            if count > 0 { count as usize } else { 0 },
+            min_block.map(|v| v as u64).unwrap_or(0),
+            max_block.map(|v| v as u64).unwrap_or(0),
+            count as usize,
         ))
     }
 
@@ -471,13 +471,13 @@ impl Store {
             "SELECT MIN(timestamp_ms), MAX(timestamp_ms), COUNT(*) FROM mempool_transactions",
         )?;
 
-        let (min_ts, max_ts, count): (i64, i64, i64) =
+        let (min_ts, max_ts, count): (Option<i64>, Option<i64>, i64) =
             stmt.query_row([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
 
         Ok((
-            if min_ts > 0 { min_ts as u64 } else { 0 },
-            if max_ts > 0 { max_ts as u64 } else { 0 },
-            if count > 0 { count as usize } else { 0 },
+            min_ts.map(|v| v as u64).unwrap_or(0),
+            max_ts.map(|v| v as u64).unwrap_or(0),
+            count as usize,
         ))
     }
 

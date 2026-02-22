@@ -4,6 +4,7 @@ members = [
   "crates/mev-sim",
   "crates/mev-analysis",
   "crates/mev-cli",
+  "tests",
 ]
 resolver = "2"
 

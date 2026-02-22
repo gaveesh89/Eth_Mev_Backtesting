@@ -1,0 +1,20 @@
+[package]
+name = "mev-integration-tests"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+mev-data = { path = "../crates/mev-data" }
+mev-sim = { path = "../crates/mev-sim" }
+mev-analysis = { path = "../crates/mev-analysis" }
+alloy = { workspace = true }
+eyre = { workspace = true }
+
+[[test]]
+name = "simulation"
+path = "simulation.rs"
+
+[[test]]
+name = "analysis"
+path = "analysis.rs"

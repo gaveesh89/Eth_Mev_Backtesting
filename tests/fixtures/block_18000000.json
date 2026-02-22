@@ -1,0 +1,3 @@
+// Fetch from RPC and paste here before running integration tests
+// Example: curl https://mainnet.infura.io/v3/YOUR_KEY -X POST -H "Content-Type: application/json" \
+//          -d '{"jsonrpc":"2.0","method":"eth_getBlockByNumber","params":["0x112a880", true],"id":1}' > block_18000000.json

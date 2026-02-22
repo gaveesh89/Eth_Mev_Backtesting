@@ -534,10 +534,15 @@ async fn handle_status(ctx: &AppContext, _args: StatusArgs) -> Result<()> {
         .count_simulations()
         .wrap_err("failed to query simulation count")?;
 
-    // Get database file size
-    let db_size_bytes = std::fs::metadata(&ctx.db_path)
-        .wrap_err_with(|| format!("failed to stat database file {}", ctx.db_path))?
-        .len();
+    // Get database file size (handle in-memory databases gracefully)
+    let db_size_str = if ctx.db_path == ":memory:" {
+        "N/A (in-memory)".to_string()
+    } else {
+        match std::fs::metadata(&ctx.db_path) {
+            Ok(metadata) => format!("{} MB", metadata.len() / 1_000_000),
+            Err(_) => "N/A (file not found)".to_string(),
+        }
+    };
 
     // Format timestamps to datetime
     let min_datetime = if min_ts_ms > 0 {
@@ -562,10 +567,7 @@ async fn handle_status(ctx: &AppContext, _args: StatusArgs) -> Result<()> {
     table.set_header(vec!["Metric", "Value"]);
 
     table.add_row(vec!["Database Path", ctx.db_path.as_str()]);
-    table.add_row(vec![
-        "DB Size",
-        &format!("{} MB", db_size_bytes / 1_000_000),
-    ]);
+    table.add_row(vec!["DB Size", &db_size_str]);
 
     if block_count > 0 {
         table.add_row(vec!["Blocks", &format!("{}", block_count)]);

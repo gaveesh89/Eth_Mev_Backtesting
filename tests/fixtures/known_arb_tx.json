@@ -1,0 +1,4 @@
+// Paste a confirmed arb tx from EigenPhi here before running integration tests
+// Example MEV transaction you can find from:
+// - https://eigenphi.io/mev/tx (search for arbitrage transactions)
+// - Fetch the full tx details from RPC using eth_getTransactionByHash
