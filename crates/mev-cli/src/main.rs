@@ -1,1 +1,3 @@
-fn main() { println!("mev-backtest"); }
+fn main() {
+    println!("mev-backtest");
+}
