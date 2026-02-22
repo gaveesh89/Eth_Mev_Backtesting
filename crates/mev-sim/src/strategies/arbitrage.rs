@@ -165,7 +165,8 @@ fn amount_out(amount_in: u128, reserve_in: u128, reserve_out: u128) -> u128 {
 }
 
 fn relative_discrepancy_bps(pool_a: &PoolState, pool_b: &PoolState) -> u128 {
-    if pool_a.reserve0 == 0 || pool_a.reserve1 == 0 || pool_b.reserve0 == 0 || pool_b.reserve1 == 0 {
+    if pool_a.reserve0 == 0 || pool_a.reserve1 == 0 || pool_b.reserve0 == 0 || pool_b.reserve1 == 0
+    {
         return 0;
     }
 
@@ -192,10 +193,9 @@ fn optimal_input_from_spec(pool_buy: &PoolState, pool_sell: &PoolState) -> u128 
         return 0;
     }
 
-    let inside = (pool_buy.reserve0 as f64)
-        * (pool_sell.reserve0 as f64)
-        * (pool_buy.reserve1 as f64)
-        / (pool_sell.reserve1 as f64);
+    let inside =
+        (pool_buy.reserve0 as f64) * (pool_sell.reserve0 as f64) * (pool_buy.reserve1 as f64)
+            / (pool_sell.reserve1 as f64);
 
     if inside <= 0.0 {
         return 0;
@@ -318,8 +318,7 @@ pub async fn fetch_pool_states(
             continue;
         }
 
-        let decoded = match IUniswapV2Pair::getReservesCall::abi_decode_returns(&sim.output, true)
-        {
+        let decoded = match IUniswapV2Pair::getReservesCall::abi_decode_returns(&sim.output, true) {
             Ok(decoded) => decoded,
             Err(error) => {
                 tracing::debug!(
@@ -398,8 +397,16 @@ mod tests {
 
     #[test]
     fn equal_prices_no_arb() {
-        let pool_a = mk_pool(alloy::primitives::address!("1111111111111111111111111111111111111111"), 1_000_000, 2_000_000_000);
-        let pool_b = mk_pool(alloy::primitives::address!("2222222222222222222222222222222222222222"), 500_000, 1_000_000_000);
+        let pool_a = mk_pool(
+            alloy::primitives::address!("1111111111111111111111111111111111111111"),
+            1_000_000,
+            2_000_000_000,
+        );
+        let pool_b = mk_pool(
+            alloy::primitives::address!("2222222222222222222222222222222222222222"),
+            500_000,
+            1_000_000_000,
+        );
 
         let result = detect_v2_arb_opportunity(&pool_a, &pool_b, 1);
         assert!(result.is_none());
@@ -409,8 +416,16 @@ mod tests {
     fn half_percent_discrepancy_finds_arb() {
         // Pool A price: 2000 (2,000,000,000 / 1,000,000)
         // Pool B price: 2010 (2,010,000,000 / 1,000,000) = 0.5% discrepancy
-        let pool_a = mk_pool(alloy::primitives::address!("3333333333333333333333333333333333333333"), 1_000_000, 2_000_000_000);
-        let pool_b = mk_pool(alloy::primitives::address!("4444444444444444444444444444444444444444"), 1_000_000, 2_010_000_000);
+        let pool_a = mk_pool(
+            alloy::primitives::address!("3333333333333333333333333333333333333333"),
+            1_000_000,
+            2_000_000_000,
+        );
+        let pool_b = mk_pool(
+            alloy::primitives::address!("4444444444444444444444444444444444444444"),
+            1_000_000,
+            2_010_000_000,
+        );
 
         let result = detect_v2_arb_opportunity(&pool_a, &pool_b, 0);
         assert!(result.is_some());
@@ -422,8 +437,16 @@ mod tests {
     #[test]
     fn below_threshold_no_arb() {
         // ~0.05% discrepancy: should be below 0.1% threshold.
-        let pool_a = mk_pool(alloy::primitives::address!("5555555555555555555555555555555555555555"), 1_000_000, 2_000_000_000);
-        let pool_b = mk_pool(alloy::primitives::address!("6666666666666666666666666666666666666666"), 1_000_000, 2_001_000_000);
+        let pool_a = mk_pool(
+            alloy::primitives::address!("5555555555555555555555555555555555555555"),
+            1_000_000,
+            2_000_000_000,
+        );
+        let pool_b = mk_pool(
+            alloy::primitives::address!("6666666666666666666666666666666666666666"),
+            1_000_000,
+            2_001_000_000,
+        );
 
         let result = detect_v2_arb_opportunity(&pool_a, &pool_b, 1);
         assert!(result.is_none());

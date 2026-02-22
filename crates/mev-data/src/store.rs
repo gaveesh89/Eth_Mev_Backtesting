@@ -311,6 +311,132 @@ impl Store {
 
         Ok(count == expected)
     }
+
+    /// Retrieve all on-chain block transactions for a given block number.
+    ///
+    /// # Errors
+    /// Returns error if database query fails.
+    pub fn get_block_txs(&self, block_number: u64) -> Result<Vec<BlockTransaction>> {
+        let conn = self.conn.borrow();
+        let mut stmt = conn.prepare(
+            "
+            SELECT block_number, tx_hash, tx_index, from_address, to_address,
+                   gas_used, effective_gas_price, status
+            FROM block_transactions
+            WHERE block_number = ?
+            ORDER BY tx_index ASC
+            ",
+        )?;
+
+        let txs = stmt
+            .query_map(rusqlite::params![block_number], |row| {
+                Ok(BlockTransaction {
+                    block_number: row.get(0)?,
+                    tx_hash: row.get(1)?,
+                    tx_index: row.get(2)?,
+                    from_address: row.get(3)?,
+                    to_address: row.get(4)?,
+                    gas_used: row.get(5)?,
+                    effective_gas_price: row.get(6)?,
+                    status: row.get(7)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(txs)
+    }
+
+    /// Retrieve simulated block values by ordering algorithm for a block.
+    ///
+    /// Returns `(egp_simulated_total_value_wei, profit_simulated_total_value_wei)`.
+    ///
+    /// # Errors
+    /// Returns error if database query fails.
+    pub fn get_simulated_values_for_block(
+        &self,
+        block_number: u64,
+    ) -> Result<(Option<u128>, Option<u128>)> {
+        fn parse_wei(value: &str) -> u128 {
+            if value.starts_with("0x") {
+                u128::from_str_radix(value.trim_start_matches("0x"), 16).unwrap_or(0)
+            } else {
+                value.parse::<u128>().unwrap_or(0)
+            }
+        }
+
+        let conn = self.conn.borrow();
+        let mut stmt = conn.prepare(
+            "
+            SELECT ordering_algorithm, total_value_wei
+            FROM simulation_results
+            WHERE block_number = ?
+            ",
+        )?;
+
+        let mut rows = stmt.query(rusqlite::params![block_number])?;
+        let mut egp_value: Option<u128> = None;
+        let mut profit_value: Option<u128> = None;
+
+        while let Some(row) = rows.next()? {
+            let algorithm: String = row.get(0)?;
+            let total_value_wei: String = row.get(1)?;
+            let parsed = parse_wei(&total_value_wei);
+
+            match algorithm.to_lowercase().as_str() {
+                "egp" => {
+                    egp_value = Some(egp_value.unwrap_or(0).max(parsed));
+                }
+                "profit" => {
+                    profit_value = Some(profit_value.unwrap_or(0).max(parsed));
+                }
+                _ => {}
+            }
+        }
+
+        Ok((egp_value, profit_value))
+    }
+
+    /// Insert a simulation result row.
+    ///
+    /// # Arguments
+    /// * `block_number` - Block number simulated
+    /// * `ordering_algorithm` - Algorithm used (e.g. "egp" or "profit")
+    /// * `tx_count` - Number of transactions in the ordered result
+    /// * `gas_used` - Total gas used
+    /// * `total_value_wei` - Total simulated value in Wei (as hex string "0x...")
+    /// * `mev_captured_wei` - MEV captured estimate in Wei (as hex string "0x...")
+    ///
+    /// # Errors
+    /// Returns error if database insert fails.
+    pub fn insert_simulation_result(
+        &self,
+        block_number: u64,
+        ordering_algorithm: &str,
+        tx_count: usize,
+        gas_used: u64,
+        total_value_wei: &str,
+        mev_captured_wei: &str,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.conn.borrow_mut().execute(
+            "
+            INSERT INTO simulation_results (
+                block_number, ordering_algorithm, simulated_at, tx_count, gas_used,
+                total_value_wei, mev_captured_wei
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ",
+            rusqlite::params![
+                block_number,
+                ordering_algorithm,
+                now,
+                tx_count as i64,
+                gas_used as i64,
+                total_value_wei,
+                mev_captured_wei,
+            ],
+        )?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

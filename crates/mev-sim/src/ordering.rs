@@ -289,14 +289,14 @@ mod tests {
 
         // Create type-2 transactions with different EGPs
         // EGP = min(max_fee_per_gas, base_fee + max_priority_fee_per_gas)
-        
+
         // tx1: max_fee=100 gwei, priority=1 gwei
         // EGP = min(100_000_000_000, 50_000_000_000 + 1_000_000_000) = 51_000_000_000
         let tx1 = tx_with_type_and_fees(
             2,
             "0x0",
-            "0x174876E800",    // max_fee = 100 gwei = 100,000,000,000 Wei
-            "0x3B9ACA00",      // priority_fee = 1 gwei = 1,000,000,000 Wei
+            "0x174876E800", // max_fee = 100 gwei = 100,000,000,000 Wei
+            "0x3B9ACA00",   // priority_fee = 1 gwei = 1,000,000,000 Wei
             21_000,
         );
 
@@ -305,8 +305,8 @@ mod tests {
         let tx2 = tx_with_type_and_fees(
             2,
             "0x0",
-            "0x254DF2D000",     // max_fee = 160 gwei = 160,000,000,000 Wei
-            "0xB2D05E00",       // priority_fee = 3 gwei = 3,000,000,000 Wei
+            "0x254DF2D000", // max_fee = 160 gwei = 160,000,000,000 Wei
+            "0xB2D05E00",   // priority_fee = 3 gwei = 3,000,000,000 Wei
             21_000,
         );
 
@@ -314,9 +314,9 @@ mod tests {
         // EGP = 160_000_000_000
         let tx3 = tx_with_type_and_fees(
             0,
-            "0x254DF2D000",     // gas_price = 160 gwei = 160,000,000,000 Wei
-            "0x0",              // ignored for type-0
-            "0x0",              // ignored for type-0
+            "0x254DF2D000", // gas_price = 160 gwei = 160,000,000,000 Wei
+            "0x0",          // ignored for type-0
+            "0x0",          // ignored for type-0
             21_000,
         );
 
@@ -342,18 +342,18 @@ mod tests {
         let tx1 = tx_with_type_and_fees(
             2,
             "0x0",
-            "0x174876E800",     // max_fee = 100 gwei
-            "0x3B9ACA00",       // priority_fee = 1 gwei
-            20_000_000,         // 20M gas (will fit)
+            "0x174876E800", // max_fee = 100 gwei
+            "0x3B9ACA00",   // priority_fee = 1 gwei
+            20_000_000,     // 20M gas (will fit)
         );
 
         // tx2: 15M gas, same EGP as tx1 but together would exceed 30M limit
         let tx2 = tx_with_type_and_fees(
             2,
             "0x0",
-            "0x174876E800",     // max_fee = 100 gwei
-            "0x3B9ACA00",       // priority_fee = 1 gwei
-            15_000_000,         // 15M gas (exceeds limit when added to tx1)
+            "0x174876E800", // max_fee = 100 gwei
+            "0x3B9ACA00",   // priority_fee = 1 gwei
+            15_000_000,     // 15M gas (exceeds limit when added to tx1)
         );
 
         // tx3: 5M gas, max_fee=30 gwei, priority=0 gwei
@@ -362,16 +362,21 @@ mod tests {
         let tx3 = tx_with_type_and_fees(
             2,
             "0x0",
-            "0x6FC23AC00",      // max_fee = 30 gwei
-            "0x0",              // priority_fee = 0 gwei
-            5_000_000,          // 5M gas
+            "0x6FC23AC00", // max_fee = 30 gwei
+            "0x0",         // priority_fee = 0 gwei
+            5_000_000,     // 5M gas
         );
 
         let txs = vec![tx1.clone(), tx2.clone(), tx3.clone()];
         let (ordered, rejected) = order_by_egp(txs, base_fee);
 
         // tx1 (20M) should fit, tx2 (15M) would exceed 30M limit, tx3 filtered by base_fee
-        assert_eq!(ordered.len(), 1, "only tx1 should fit within 30M gas limit, got {} txs", ordered.len());
+        assert_eq!(
+            ordered.len(),
+            1,
+            "only tx1 should fit within 30M gas limit, got {} txs",
+            ordered.len()
+        );
         assert_eq!(rejected, 2, "tx2 exceeds limit, tx3 below base_fee");
         assert_eq!(ordered[0].hash, tx1.hash, "tx1 should be included");
     }
@@ -399,16 +404,10 @@ mod tests {
                 .push(tx.nonce);
         }
 
-        let mut a = by_sender
-            .get(sender_a)
-            .cloned()
-            .unwrap_or_default();
+        let mut a = by_sender.get(sender_a).cloned().unwrap_or_default();
         a.sort_unstable();
 
-        let mut b = by_sender
-            .get(sender_b)
-            .cloned()
-            .unwrap_or_default();
+        let mut b = by_sender.get(sender_b).cloned().unwrap_or_default();
         b.sort_unstable();
 
         assert_eq!(a, vec![0], "sender A nonce gap should remove nonce 2");
