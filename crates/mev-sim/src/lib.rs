@@ -5,5 +5,8 @@
 
 pub mod decoder;
 pub mod evm;
+pub mod ordering;
+pub mod strategies;
 
 pub use evm::{EvmFork, SimResult};
+pub use ordering::{OrderedBlock, OrderingAlgorithm};
