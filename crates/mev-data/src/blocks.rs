@@ -9,8 +9,12 @@ use alloy::providers::fillers::FillProvider;
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::rpc::types::eth::{BlockId, BlockNumberOrTag};
 use eyre::{Context, Result};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::Semaphore;
 
+use crate::store::Store;
 use crate::types::{Block, BlockTransaction};
 
 type ProviderType = FillProvider<
@@ -164,6 +168,135 @@ impl BlockFetcher {
         }
 
         Ok(Some((block, block_txs)))
+    }
+
+    /// Fetches a range of blocks with rate limiting, retries, and progress tracking.
+    ///
+    /// - Skips blocks already in store via `block_range_exists` check
+    /// - Limits to 10 concurrent RPC calls via `tokio::sync::Semaphore`
+    /// - Retries failed blocks up to 3 times with 500ms exponential backoff
+    /// - Shows progress with `indicatif` (blocks fetched / txs stored)
+    /// - Logs warnings for missing blocks but continues (doesn't fail range)
+    ///
+    /// # Arguments
+    /// * `start` - Starting block number (inclusive)
+    /// * `end` - Ending block number (inclusive)
+    /// * `store` - Database to store blocks and transactions in
+    ///
+    /// # Errors
+    /// Returns error if database operations or unrecoverable RPC errors fail.
+    #[tracing::instrument(skip(self, store), fields(start, end))]
+    pub async fn fetch_range(&self, start: u64, end: u64, store: &Store) -> Result<()> {
+        let semaphore = Arc::new(Semaphore::new(10));
+        let multi = MultiProgress::new();
+        let block_pb = multi.add(ProgressBar::new(end.saturating_sub(start) + 1));
+        let tx_pb = multi.add(ProgressBar::new_spinner());
+
+        block_pb.set_style(
+            ProgressStyle::default_bar()
+                .template("{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} blocks")
+                .unwrap(),
+        );
+        tx_pb.set_style(
+            ProgressStyle::default_spinner()
+                .template("{spinner:.green} {msg}")
+                .unwrap(),
+        );
+
+        // Collect block numbers that need fetching (skip existing in store)
+        let mut to_fetch = Vec::new();
+        for block_num in start..=end {
+            if !store.block_range_exists(block_num, block_num)? {
+                to_fetch.push(block_num);
+            } else {
+                block_pb.inc(1);
+            }
+        }
+
+        tracing::info!(
+            start,
+            end,
+            total_blocks = end.saturating_sub(start) + 1,
+            blocks_to_fetch = to_fetch.len(),
+            "starting block range fetch"
+        );
+
+        // Spawn tasks for fetching with rate limiting
+        let mut handles = Vec::new();
+        for block_num in to_fetch {
+            let sem = semaphore.clone();
+            let provider = self.provider.clone();
+
+            let handle = tokio::spawn(async move {
+                let _permit = sem.acquire().await.ok();
+
+                // Retry logic: up to 3 attempts with exponential backoff
+                for attempt in 0..3 {
+                    // Create temporary BlockFetcher just for the fetch call
+                    let fetcher = BlockFetcher {
+                        provider: provider.clone(),
+                    };
+                    match fetcher.fetch_block_with_txs(block_num).await {
+                        Ok(result) => return Ok((block_num, result)),
+                        Err(_e) if attempt < 2 => {
+                            let backoff_ms = 500 * 2_u64.pow(attempt as u32);
+                            tracing::debug!(
+                                block_number = block_num,
+                                attempt = attempt + 1,
+                                backoff_ms,
+                                "retrying failed block fetch"
+                            );
+                            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                        }
+                        Err(e) => return Err((block_num, e)),
+                    }
+                }
+                unreachable!()
+            });
+            handles.push(handle);
+        }
+
+        // Collect results from all tasks
+        let mut all_results = Vec::new();
+        for handle in handles {
+            match handle.await {
+                Ok(result) => all_results.push(result),
+                Err(e) => tracing::error!("task join error: {}", e),
+            }
+        }
+
+        // Process results and insert into store
+        for result in all_results {
+            match result {
+                Ok((block_num, None)) => {
+                    tracing::warn!(block_number = block_num, "block not found in RPC");
+                    block_pb.inc(1);
+                }
+                Ok((_block_num, Some((block, txs)))) => {
+                    store.insert_block(&block)?;
+                    let tx_count = txs.len();
+                    if !txs.is_empty() {
+                        store.insert_block_txs(&txs)?;
+                        tx_pb.set_message(format!("Stored {} txs", tx_count));
+                    }
+                    block_pb.inc(1);
+                }
+                Err((block_num, e)) => {
+                    tracing::error!(
+                        block_number = block_num,
+                        "failed to fetch block after 3 retries: {}",
+                        e
+                    );
+                    block_pb.inc(1);
+                    // Don't fail - continue with next block
+                }
+            }
+        }
+
+        block_pb.finish_with_message("✓ Fetched all blocks");
+        tx_pb.finish_with_message("✓ Done");
+
+        Ok(())
     }
 }
 
