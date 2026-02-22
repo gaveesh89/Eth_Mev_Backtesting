@@ -437,6 +437,62 @@ impl Store {
         )?;
         Ok(())
     }
+
+    /// Get min/max block numbers from blocks table.
+    ///
+    /// Returns `(min_block, max_block, count)` or `(0, 0, 0)` if empty.
+    ///
+    /// # Errors
+    /// Returns error if database query fails.
+    pub fn get_block_range(&self) -> Result<(u64, u64, usize)> {
+        let conn = self.conn.borrow();
+        let mut stmt =
+            conn.prepare("SELECT MIN(block_number), MAX(block_number), COUNT(*) FROM blocks")?;
+
+        let (min_block, max_block, count): (i64, i64, i64) =
+            stmt.query_row([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+
+        Ok((
+            if min_block > 0 { min_block as u64 } else { 0 },
+            if max_block > 0 { max_block as u64 } else { 0 },
+            if count > 0 { count as usize } else { 0 },
+        ))
+    }
+
+    /// Get min/max timestamps (ms) from mempool_transactions table.
+    ///
+    /// Returns `(min_ts_ms, max_ts_ms, count)` or `(0, 0, 0)` if empty.
+    ///
+    /// # Errors
+    /// Returns error if database query fails.
+    pub fn get_mempool_timestamp_range(&self) -> Result<(u64, u64, usize)> {
+        let conn = self.conn.borrow();
+        let mut stmt = conn.prepare(
+            "SELECT MIN(timestamp_ms), MAX(timestamp_ms), COUNT(*) FROM mempool_transactions",
+        )?;
+
+        let (min_ts, max_ts, count): (i64, i64, i64) =
+            stmt.query_row([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+
+        Ok((
+            if min_ts > 0 { min_ts as u64 } else { 0 },
+            if max_ts > 0 { max_ts as u64 } else { 0 },
+            if count > 0 { count as usize } else { 0 },
+        ))
+    }
+
+    /// Get count of simulation results.
+    ///
+    /// # Errors
+    /// Returns error if database query fails.
+    pub fn count_simulations(&self) -> Result<usize> {
+        let conn = self.conn.borrow();
+        let mut stmt = conn.prepare("SELECT COUNT(*) FROM simulation_results")?;
+
+        let count: i64 = stmt.query_row([], |row| row.get(0))?;
+
+        Ok(count as usize)
+    }
 }
 
 #[cfg(test)]

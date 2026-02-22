@@ -204,12 +204,7 @@ async fn handle_simulate(ctx: &AppContext, args: SimulateArgs) -> Result<()> {
     let mut evm = EvmFork::at_block(args.block, &block).wrap_err("failed to create EVM fork")?;
 
     // Parse base fee
-    let base_fee_hex = &block.base_fee_per_gas;
-    let base_fee = if base_fee_hex.starts_with("0x") {
-        u128::from_str_radix(base_fee_hex.trim_start_matches("0x"), 16).unwrap_or(0)
-    } else {
-        base_fee_hex.parse::<u128>().unwrap_or(0)
-    };
+    let base_fee = parse_hex_u128(&block.base_fee_per_gas, "base_fee_per_gas")?;
 
     // Get mempool transactions for this block
     let mempool_txs = store
@@ -240,22 +235,17 @@ async fn handle_simulate(ctx: &AppContext, args: SimulateArgs) -> Result<()> {
         };
 
         let total_gas: u64 = ordered_txs.iter().map(|tx| tx.gas_limit).sum();
-        let estimated_value: u128 = ordered_txs
-            .iter()
-            .map(|tx| {
-                let gas_price_str = if tx.tx_type == 2 {
-                    &tx.max_fee_per_gas
-                } else {
-                    &tx.gas_price
-                };
-                let gas_price = if gas_price_str.starts_with("0x") {
-                    u128::from_str_radix(gas_price_str.trim_start_matches("0x"), 16).unwrap_or(0)
-                } else {
-                    gas_price_str.parse::<u128>().unwrap_or(0)
-                };
-                (tx.gas_limit as u128) * gas_price
-            })
-            .sum();
+        let mut estimated_value: u128 = 0;
+        for tx in &ordered_txs {
+            let gas_price_str = if tx.tx_type == 2 {
+                &tx.max_fee_per_gas
+            } else {
+                &tx.gas_price
+            };
+            let gas_price = parse_hex_u128(gas_price_str, "gas_price")?;
+            estimated_value =
+                estimated_value.saturating_add((tx.gas_limit as u128).saturating_mul(gas_price));
+        }
 
         // Persistence to SQLite
         let algo_name = if algo == "egp" { "egp" } else { "profit" };
@@ -303,12 +293,8 @@ async fn handle_simulate(ctx: &AppContext, args: SimulateArgs) -> Result<()> {
             } else {
                 &tx.gas_price
             };
-            let gas_price_gwei = if gas_price_str.starts_with("0x") {
-                u128::from_str_radix(gas_price_str.trim_start_matches("0x"), 16).unwrap_or(0)
-                    / 1_000_000_000
-            } else {
-                gas_price_str.parse::<u128>().unwrap_or(0) / 1_000_000_000
-            };
+            let gas_price_wei = parse_hex_u128(gas_price_str, "gas_price")?;
+            let gas_price_gwei = gas_price_wei / 1_000_000_000;
             let type_str = if tx.tx_type == 2 {
                 "EIP-1559"
             } else {
@@ -530,8 +516,89 @@ fn print_pnl_csv(
     Ok(())
 }
 
-async fn handle_status(_ctx: &AppContext, _args: StatusArgs) -> Result<()> {
-    info!("status command stub invoked");
+async fn handle_status(ctx: &AppContext, _args: StatusArgs) -> Result<()> {
+    let store = Store::new(&ctx.db_path).wrap_err("failed to open SQLite store")?;
+
+    // Get block range
+    let (min_block, max_block, block_count) = store
+        .get_block_range()
+        .wrap_err("failed to query block range")?;
+
+    // Get mempool timestamp range
+    let (min_ts_ms, max_ts_ms, mempool_count) = store
+        .get_mempool_timestamp_range()
+        .wrap_err("failed to query mempool timestamp range")?;
+
+    // Get simulation count
+    let sim_count = store
+        .count_simulations()
+        .wrap_err("failed to query simulation count")?;
+
+    // Get database file size
+    let db_size_bytes = std::fs::metadata(&ctx.db_path)
+        .wrap_err_with(|| format!("failed to stat database file {}", ctx.db_path))?
+        .len();
+
+    // Format timestamps to datetime
+    let min_datetime = if min_ts_ms > 0 {
+        chrono::DateTime::from_timestamp_millis(min_ts_ms as i64)
+            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+            .unwrap_or_else(|| "N/A".to_string())
+    } else {
+        "N/A".to_string()
+    };
+
+    let max_datetime = if max_ts_ms > 0 {
+        chrono::DateTime::from_timestamp_millis(max_ts_ms as i64)
+            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+            .unwrap_or_else(|| "N/A".to_string())
+    } else {
+        "N/A".to_string()
+    };
+
+    // Build table
+    let mut table = Table::new();
+    table.load_preset(UTF8_BORDERS_ONLY);
+    table.set_header(vec!["Metric", "Value"]);
+
+    table.add_row(vec!["Database Path", ctx.db_path.as_str()]);
+    table.add_row(vec![
+        "DB Size",
+        &format!("{} MB", db_size_bytes / 1_000_000),
+    ]);
+
+    if block_count > 0 {
+        table.add_row(vec!["Blocks", &format!("{}", block_count)]);
+        table.add_row(vec![
+            "Block Range",
+            &format!("{} - {}", min_block, max_block),
+        ]);
+    } else {
+        table.add_row(vec!["Blocks", "0"]);
+        table.add_row(vec!["Block Range", "No blocks in database"]);
+    }
+
+    if mempool_count > 0 {
+        table.add_row(vec!["Mempool Transactions", &format!("{}", mempool_count)]);
+        table.add_row(vec!["Mempool Date Range (min)", &min_datetime]);
+        table.add_row(vec!["Mempool Date Range (max)", &max_datetime]);
+    } else {
+        table.add_row(vec!["Mempool Transactions", "0"]);
+        table.add_row(vec!["Mempool Date Range", "No transactions in database"]);
+    }
+
+    table.add_row(vec!["Simulations", &format!("{}", sim_count)]);
+
+    println!("\n{}\n", table);
+
+    info!(
+        blocks = block_count,
+        mempool_txs = mempool_count,
+        simulations = sim_count,
+        db_path = %ctx.db_path,
+        "status command completed"
+    );
+
     Ok(())
 }
 
@@ -539,4 +606,13 @@ fn ensure_dir(path: &Path) -> Result<()> {
     std::fs::create_dir_all(path)
         .wrap_err_with(|| format!("failed to create data directory {}", path.display()))?;
     Ok(())
+}
+
+fn parse_hex_u128(value: &str, context: &str) -> Result<u128> {
+    let trimmed = value.trim_start_matches("0x");
+    if trimmed.is_empty() {
+        return Ok(0);
+    }
+    u128::from_str_radix(trimmed, 16)
+        .wrap_err_with(|| format!("failed to parse hex value for {}: {}", context, value))
 }
