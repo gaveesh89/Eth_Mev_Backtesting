@@ -3,8 +3,8 @@
 mod common;
 
 use common::*;
-use mev_sim::ordering::{order_by_egp, apply_nonce_constraints};
 use mev_sim::evm::EvmFork;
+use mev_sim::ordering::{apply_nonce_constraints, order_by_egp};
 
 /// Test that transactions are ordered by effective gas price (EGP) in descending order.
 ///
@@ -14,11 +14,26 @@ use mev_sim::evm::EvmFork;
 fn egp_sort_highest_gas_price_first() {
     let base_fee = 1_000_000_000u128; // 1 gwei
     let txs = vec![
-        sample_mempool_tx("0000000000000000000000000000000000000000000000000000000000000001", 10_000_000_000),
-        sample_mempool_tx("0000000000000000000000000000000000000000000000000000000000000002", 20_000_000_000),
-        sample_mempool_tx("0000000000000000000000000000000000000000000000000000000000000003", 5_000_000_000),
-        sample_mempool_tx("0000000000000000000000000000000000000000000000000000000000000004", 30_000_000_000),
-        sample_mempool_tx("0000000000000000000000000000000000000000000000000000000000000005", 15_000_000_000),
+        sample_mempool_tx(
+            "0000000000000000000000000000000000000000000000000000000000000001",
+            10_000_000_000,
+        ),
+        sample_mempool_tx(
+            "0000000000000000000000000000000000000000000000000000000000000002",
+            20_000_000_000,
+        ),
+        sample_mempool_tx(
+            "0000000000000000000000000000000000000000000000000000000000000003",
+            5_000_000_000,
+        ),
+        sample_mempool_tx(
+            "0000000000000000000000000000000000000000000000000000000000000004",
+            30_000_000_000,
+        ),
+        sample_mempool_tx(
+            "0000000000000000000000000000000000000000000000000000000000000005",
+            15_000_000_000,
+        ),
     ];
 
     let (ordered, rejected) = order_by_egp(txs, base_fee);
@@ -28,11 +43,26 @@ fn egp_sort_highest_gas_price_first() {
     assert_eq!(rejected, 0);
 
     // Verify ordering: highest gas price first
-    assert_eq!(ordered[0].hash, "0x0000000000000000000000000000000000000000000000000000000000000004"); // 30 gwei
-    assert_eq!(ordered[1].hash, "0x0000000000000000000000000000000000000000000000000000000000000002"); // 20 gwei
-    assert_eq!(ordered[2].hash, "0x0000000000000000000000000000000000000000000000000000000000000005"); // 15 gwei
-    assert_eq!(ordered[3].hash, "0x0000000000000000000000000000000000000000000000000000000000000001"); // 10 gwei
-    assert_eq!(ordered[4].hash, "0x0000000000000000000000000000000000000000000000000000000000000003"); // 5 gwei
+    assert_eq!(
+        ordered[0].hash,
+        "0x0000000000000000000000000000000000000000000000000000000000000004"
+    ); // 30 gwei
+    assert_eq!(
+        ordered[1].hash,
+        "0x0000000000000000000000000000000000000000000000000000000000000002"
+    ); // 20 gwei
+    assert_eq!(
+        ordered[2].hash,
+        "0x0000000000000000000000000000000000000000000000000000000000000005"
+    ); // 15 gwei
+    assert_eq!(
+        ordered[3].hash,
+        "0x0000000000000000000000000000000000000000000000000000000000000001"
+    ); // 10 gwei
+    assert_eq!(
+        ordered[4].hash,
+        "0x0000000000000000000000000000000000000000000000000000000000000003"
+    ); // 5 gwei
 }
 
 /// Test that nonce constraints remove transactions with gaps.
@@ -41,11 +71,17 @@ fn egp_sort_highest_gas_price_first() {
 /// Expected: only nonce 1 is kept, nonce 3 is removed due to gap.
 #[test]
 fn nonce_constraint_removes_gap() {
-    let mut tx1 = sample_mempool_tx("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 20_000_000_000);
+    let mut tx1 = sample_mempool_tx(
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        20_000_000_000,
+    );
     tx1.from_address = "0x1234567890abcdef1234567890abcdef12345678".to_string();
     tx1.nonce = 1;
 
-    let mut tx3 = sample_mempool_tx("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", 20_000_000_000);
+    let mut tx3 = sample_mempool_tx(
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        20_000_000_000,
+    );
     tx3.from_address = "0x1234567890abcdef1234567890abcdef12345678".to_string();
     tx3.nonce = 3;
 
@@ -64,13 +100,13 @@ fn nonce_constraint_removes_gap() {
 #[test]
 fn bundle_rollback_on_revert() {
     let block = sample_block(18_000_000);
-    
+
     // Create EVM fork at block 18M
     let evm = EvmFork::at_block(18_000_000, &block);
     assert!(evm.is_ok(), "EVM fork should be created successfully");
-    
+
     let evm = evm.unwrap();
-    
+
     // Verify initial state is clean (no results yet)
     assert_eq!(evm.results().len(), 0);
     assert_eq!(evm.total_gas_used(), 0);
@@ -83,8 +119,8 @@ fn bundle_rollback_on_revert() {
 /// Expected: detect_v2_arb_opportunity returns None.
 #[test]
 fn arb_detection_price_equal_no_opportunity() {
-    use mev_sim::strategies::arbitrage::{detect_v2_arb_opportunity, PoolState};
     use alloy::primitives::address;
+    use mev_sim::strategies::arbitrage::{detect_v2_arb_opportunity, PoolState};
 
     let pool_a = PoolState {
         address: address!("B4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc"),
@@ -119,13 +155,13 @@ fn arb_detection_price_equal_no_opportunity() {
 /// Expected: ArbOpportunity returned.
 #[test]
 fn arb_detection_one_percent_discrepancy() {
-    use mev_sim::strategies::arbitrage::{detect_v2_arb_opportunity, PoolState};
     use alloy::primitives::address;
+    use mev_sim::strategies::arbitrage::{detect_v2_arb_opportunity, PoolState};
 
     let pool_a = PoolState {
         address: address!("3333333333333333333333333333333333333333"),
-        token0: address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"),
-        token1: address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+        token0: address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"), // USDC
+        token1: address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"), // WETH
         reserve0: 1_000_000u128,
         reserve1: 2_000_000_000u128,
         fee_bps: 30,
@@ -133,10 +169,10 @@ fn arb_detection_one_percent_discrepancy() {
 
     let pool_b = PoolState {
         address: address!("4444444444444444444444444444444444444444"),
-        token0: address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"),
-        token1: address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+        token0: address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"), // USDC
+        token1: address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"), // WETH
         reserve0: 1_000_000u128,
-        reserve1: 2_010_000_000u128, // ~0.5% higher price
+        reserve1: 2_020_000_000u128, // ~1% higher price (2000 -> 2020)
         fee_bps: 30,
     };
 
@@ -144,9 +180,15 @@ fn arb_detection_one_percent_discrepancy() {
     let base_fee = 0u128;
     let opp = detect_v2_arb_opportunity(&pool_a, &pool_b, base_fee);
 
-    // Should detect opportunity with ~0.5% price difference
-    assert!(opp.is_some(), "should detect arb opportunity with 0.5% discrepancy");
-    
+    // Should detect opportunity with ~1% price difference (profitable after fees)
+    assert!(
+        opp.is_some(),
+        "should detect arb opportunity with 1% discrepancy"
+    );
+
     let opp = opp.unwrap();
-    assert!(opp.optimal_input_wei > 0, "optimal input should be positive");
+    assert!(
+        opp.optimal_input_wei > 0,
+        "optimal input should be positive"
+    );
 }

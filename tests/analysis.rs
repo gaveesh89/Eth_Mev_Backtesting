@@ -2,10 +2,7 @@
 
 mod common;
 
-use mev_analysis::pnl::{
-    compute_range_stats, format_eth,
-    BlockPnL,
-};
+use mev_analysis::pnl::{compute_range_stats, format_eth, BlockPnL};
 
 /// Test that capture rate is calculated correctly as simulated/actual.
 ///
@@ -21,12 +18,12 @@ fn pnl_capture_rate_calculation() {
         tx_count: 1,
         gas_used: 21_000,
         base_fee_per_gas_wei: 1_000_000_000u128,
-        actual_block_value_wei: 1_000_000_000_000_000_000u128,    // 1 ETH
-        simulated_block_value_wei: 800_000_000_000_000_000u128,    // 0.8 ETH
+        actual_block_value_wei: 1_000_000_000_000_000_000u128, // 1 ETH
+        simulated_block_value_wei: 800_000_000_000_000_000u128, // 0.8 ETH
         egp_simulated_value_wei: 800_000_000_000_000_000u128,
         profit_simulated_value_wei: 0u128,
         mev_captured_wei: 0u128,
-        private_flow_estimate_wei: 200_000_000_000_000_000u128,    // 0.2 ETH
+        private_flow_estimate_wei: 200_000_000_000_000_000u128, // 0.2 ETH
         value_gap_wei: -200_000_000_000_000_000i128,
         capture_rate: 0.8,
     };

@@ -18,3 +18,7 @@ path = "simulation.rs"
 [[test]]
 name = "analysis"
 path = "analysis.rs"
+
+[[test]]
+name = "arbitrage_correctness"
+path = "arbitrage_correctness.rs"
