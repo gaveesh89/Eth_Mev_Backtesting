@@ -128,7 +128,10 @@ fn arb_detection_price_equal_no_opportunity() {
         token1: address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"),
         reserve0: 1_000_000_000_000,
         reserve1: 1_000_000_000_000,
-        fee_bps: 30,
+        fee_numerator: 997,
+        fee_denominator: 1000,
+        block_number: 18_000_000,
+        timestamp_last: 1_000_000,
     };
 
     let pool_b = PoolState {
@@ -137,14 +140,17 @@ fn arb_detection_price_equal_no_opportunity() {
         token1: address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"),
         reserve0: 1_000_000_000_000,
         reserve1: 1_000_000_000_000,
-        fee_bps: 30,
+        fee_numerator: 997,
+        fee_denominator: 1000,
+        block_number: 18_000_000,
+        timestamp_last: 1_000_000,
     };
 
     let base_fee = 1_000_000_000u128; // 1 gwei
-    let opp = detect_v2_arb_opportunity(&pool_a, &pool_b, base_fee);
+    let opp = detect_v2_arb_opportunity(&pool_a, &pool_b, base_fee, None);
 
     // No opportunity when prices are identical (discrepancy = 0%)
-    assert!(opp.is_none());
+    assert!(opp.ok().flatten().is_none());
 }
 
 /// Test arbitrage detection finds opportunity with 0.5% price discrepancy.
@@ -164,7 +170,10 @@ fn arb_detection_one_percent_discrepancy() {
         token1: address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"), // WETH
         reserve0: 1_000_000u128,
         reserve1: 2_000_000_000u128,
-        fee_bps: 30,
+        fee_numerator: 997,
+        fee_denominator: 1000,
+        block_number: 18_000_000,
+        timestamp_last: 1_000_000,
     };
 
     let pool_b = PoolState {
@@ -173,22 +182,26 @@ fn arb_detection_one_percent_discrepancy() {
         token1: address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"), // WETH
         reserve0: 1_000_000u128,
         reserve1: 2_020_000_000u128, // ~1% higher price (2000 -> 2020)
-        fee_bps: 30,
+        fee_numerator: 997,
+        fee_denominator: 1000,
+        block_number: 18_000_000,
+        timestamp_last: 1_000_000,
     };
 
     // Use base_fee=0 to avoid gas floor constraint in test
     let base_fee = 0u128;
-    let opp = detect_v2_arb_opportunity(&pool_a, &pool_b, base_fee);
+    let opp = detect_v2_arb_opportunity(&pool_a, &pool_b, base_fee, None);
 
     // Should detect opportunity with ~1% price difference (profitable after fees)
-    assert!(
-        opp.is_some(),
-        "should detect arb opportunity with 1% discrepancy"
-    );
-
-    let opp = opp.unwrap();
-    assert!(
-        opp.optimal_input_wei > 0,
-        "optimal input should be positive"
-    );
+    match opp {
+        Ok(Some(opp)) => {
+            assert!(
+                opp.optimal_input_wei > 0,
+                "optimal input should be positive"
+            );
+        }
+        _ => {
+            panic!("should detect arb opportunity with 1% discrepancy")
+        }
+    }
 }

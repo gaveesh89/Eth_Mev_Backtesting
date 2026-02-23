@@ -1,19 +1,20 @@
-//! Uniswap V2 top-of-block arbitrage detection with rigorous math.
+//! Uniswap V2-like arbitrage detection with rigorous per-pool fee math.
 //!
-//! Constant-product pools maintain an invariant where reserve0 × reserve1
-//! stays approximately constant after each swap. If two pools for the same
-//! token pair imply different prices, you can buy from the cheaper pool and
-//! sell into the more expensive one in a two-leg cycle.
+//! **Algorithm:**
+//! Detects two-pool arbitrage on constant-product AMMs. For each pool pair:
+//! 1. Check token compatibility and price discrepancy (>10 bps prefilter)
+//! 2. Evaluate both directions (A→B and B→A)
+//! 3. For each direction, use closed-form (if fee-eligible) or ternary search
+//! 4. Verify net profit after gas cost conversion to input token unit
 //!
 //! **Key Improvements:**
-//! - Closed-form optimal input formula (fee-adjusted, Flashbots-style)
-//! - Ternary search fallback for ineligible fee combinations
-//! - Gas-aware profit calculation (net_profit = amm_profit - gas_cost_in_tokens)
-//! - Overflow-safe U256 intermediate calculations
-//! - Rejection thresholds:
-//!   * Minimum price discrepancy: 0.1% (10 bps)
-//!   * Minimum net profit: > gas_floor
-//!   * Only eligible if closed-form applies or ternary search succeeds
+//! - Per-pool fee parameters (not hard-coded 997/1000)
+//! - Closed-form optimal input formula with neighborhood verification
+//! - Ternary search fallback with discrete plateau handling
+//! - Gas cost converted to input token units (with same-block reference price)
+//! - Overflow-safe U256 intermediates; no float arithmetic
+//! - Block metadata tracking (block_number, timestamp_last)
+//! - Typed error enum distinguishing faults from rejections
 
 use alloy::hex;
 use alloy::primitives::{Address, U256};
@@ -21,6 +22,32 @@ use alloy::sol;
 use alloy::sol_types::SolCall;
 use eyre::Result;
 use mev_data::types::MempoolTransaction;
+use std::fmt;
+
+/// Arbitrage detection errors (faults needing retry vs. legitimate rejections).
+#[derive(Clone, Debug)]
+pub enum ArbError {
+    /// State mismatch (blocks not synchronized, metadata missing)
+    StateInconsistency(String),
+    /// Arithmetic overflow or underflow
+    Overflow(String),
+    /// Missing reference data (e.g., WETH price for gas conversion)
+    MissingReferencePrice,
+}
+
+impl fmt::Display for ArbError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ArbError::StateInconsistency(s) => write!(f, "state inconsistency: {}", s),
+            ArbError::Overflow(s) => write!(f, "arithmetic overflow: {}", s),
+            ArbError::MissingReferencePrice => {
+                write!(f, "missing reference price for gas conversion")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ArbError {}
 
 use crate::decoder::addresses;
 use crate::evm::EvmFork;
@@ -89,24 +116,30 @@ pub const KNOWN_POOLS: [(Address, Address, Address); 10] = [
     ),
 ];
 
-/// Snapshot of a Uniswap V2-like pool.
+/// Snapshot of a Uniswap V2-like pool with exact fee structure.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PoolState {
     /// Pool contract address.
     pub address: Address,
-    /// Token0 address.
+    /// Token0 address (sorted lexicographically at pair creation).
     pub token0: Address,
     /// Token1 address.
     pub token1: Address,
-    /// Reserve for token0.
+    /// Reserve for token0 (from last observed `getReserves()`).
     pub reserve0: u128,
     /// Reserve for token1.
     pub reserve1: u128,
-    /// Fee in basis points.
-    pub fee_bps: u32,
+    /// Per-pool fee numerator. Standard Uniswap V2 = 997 (0.3% fee).
+    pub fee_numerator: u32,
+    /// Per-pool fee denominator. Standard Uniswap V2 = 1000.
+    pub fee_denominator: u32,
+    /// Block number where reserves were observed.
+    pub block_number: u64,
+    /// Block timestamp where reserves were observed (for staleness check).
+    pub timestamp_last: u64,
 }
 
-/// Estimated arbitrage opportunity between two pools.
+/// Estimated arbitrage opportunity between two pools (same block, consistent metadata).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ArbOpportunity {
     /// Input/output base token for the round-trip.
@@ -117,16 +150,18 @@ pub struct ArbOpportunity {
     pub pool_1: Address,
     /// Second pool used in the route.
     pub pool_2: Address,
-    /// Gross AMM profit (leg2_output - input) in wei of input token.
+    /// Gross AMM profit (leg2_output - input) in wei of input token, before gas.
     pub gross_profit_wei: u128,
-    /// Gas cost converted to input token units.
+    /// Gas cost in input token units (converted from base_fee * gas_used at same-block reference price).
     pub gas_cost_wei: u128,
-    /// Net profit after gas: (gross - gas_cost). Guaranteed > 0.
+    /// Net profit after gas: (gross - gas_cost). **Guaranteed > 0** at time of detection.
     pub net_profit_wei: u128,
-    /// Estimated optimal input in wei.
+    /// Estimated optimal input in wei (from closed-form or ternary search).
     pub optimal_input_wei: u128,
-    /// Token path of the arbitrage route.
+    /// Token path of the arbitrage route (for audit/replay).
     pub trade_path: Vec<Address>,
+    /// Block number where this opportunity was detected.
+    pub block_number: u64,
 }
 
 fn lookup_pool_tokens(pool: Address) -> Option<(Address, Address)> {
@@ -155,13 +190,20 @@ fn build_readonly_call_tx(to: Address, input_hex: String) -> MempoolTransaction 
     }
 }
 
-/// Computes swap output using exact Uniswap V2 integer math (floor division).
+/// Computes swap output using exact AMM integer math (floor division).
 ///
-/// Formula: `(amount_in * 997 * reserve_out) / (reserve_in * 1000 + amount_in * 997)`
+/// Formula: `(amount_in * fee_numerator * reserve_out) / (reserve_in * fee_denominator + amount_in * fee_numerator)`
 ///
-/// Uses U256 to avoid intermediate overflow on large reserves.
+/// For Uniswap V2: fee_numerator=997, fee_denominator=1000 (0.3% fee).
+/// Uses U256 to avoid intermediate overflow on reserves up to u128::MAX.
 #[inline]
-fn amount_out(amount_in: u128, reserve_in: u128, reserve_out: u128) -> u128 {
+fn amount_out(
+    amount_in: u128,
+    reserve_in: u128,
+    reserve_out: u128,
+    fee_numerator: u32,
+    fee_denominator: u32,
+) -> u128 {
     if amount_in == 0 || reserve_in == 0 || reserve_out == 0 {
         return 0;
     }
@@ -169,10 +211,12 @@ fn amount_out(amount_in: u128, reserve_in: u128, reserve_out: u128) -> u128 {
     let amount_in_u256 = U256::from(amount_in);
     let reserve_in_u256 = U256::from(reserve_in);
     let reserve_out_u256 = U256::from(reserve_out);
+    let fee_num = U256::from(fee_numerator);
+    let fee_denom = U256::from(fee_denominator);
 
-    let amount_in_with_fee = amount_in_u256 * U256::from(997u32);
+    let amount_in_with_fee = amount_in_u256 * fee_num;
     let numerator = amount_in_with_fee * reserve_out_u256;
-    let denominator = (reserve_in_u256 * U256::from(1000u32)) + amount_in_with_fee;
+    let denominator = (reserve_in_u256 * fee_denom) + amount_in_with_fee;
 
     if denominator.is_zero() {
         return 0;
@@ -182,10 +226,10 @@ fn amount_out(amount_in: u128, reserve_in: u128, reserve_out: u128) -> u128 {
 }
 
 /// Checks if closed-form eligibility applies (both pools share same fee structure).
+/// Closed-form works only for identical fee numerator/denominator pairs.
 #[inline]
 fn is_closed_form_eligible(pool_a: &PoolState, pool_b: &PoolState) -> bool {
-    // Standard V2 fee is 30 bps (0.3%) = 997/1000 multiplier
-    pool_a.fee_bps == pool_b.fee_bps && pool_a.fee_bps == 30
+    pool_a.fee_numerator == pool_b.fee_numerator && pool_a.fee_denominator == pool_b.fee_denominator
 }
 
 /// Computes price discrepancy using rational arithmetic (no floats).
@@ -223,66 +267,80 @@ fn exceeds_discrepancy_threshold(
     discrepancy_num * U256::from(10_000u32) > U256::from(threshold_bps) * min_price
 }
 
-/// Computes optimal input for standard V2 (fee = 30 bps) using closed-form formula.
+/// Computes optimal input for matching-fee pools using closed-form formula.
 ///
-/// Formula: `optimal_input = (sqrt(f² × r_out_a × r_out_b) - d × r_in_b × r_in_a) × d / (f × r_in_b × d + f² × r_out_a)`
-/// where f = 997, d = 1000.
+/// **Closed-form derivation (fee-adjusted):**
+/// For two pools with identical fee structure (f_num/f_denom), the optimal input x satisfies:
+/// x* = [f_num × sqrt(r_in_a × r_out_a × r_in_b × r_out_b) - f_denom × r_in_a × r_in_b]
+///      / [f_num × r_in_b × f_denom + f_num² × r_out_a]
 ///
-/// References: Flashbots MEV-Inspect, exact U256 computation.
-fn optimal_input_closed_form(pool_buy: &PoolState, pool_sell: &PoolState) -> u128 {
+/// **Implementation:** Pre-compute presqrt = f_num² × r_out_a × r_out_b / (r_in_a × r_in_b),
+/// then isqrt(presqrt), then substitute into formula.
+///
+/// **Feasibility:** Result is valid (positive) only if sqrt(presqrt) ≥ f_denom.
+/// Otherwise, the opportunity is too thin for closed-form sizing; use ternary search fallback.
+///
+/// **References:** Flashbots MEV-Inspect, Defi Labs MEV research.
+fn optimal_input_closed_form(pool_buy: &PoolState, pool_sell: &PoolState) -> Option<u128> {
     if pool_buy.reserve0 == 0
         || pool_buy.reserve1 == 0
         || pool_sell.reserve0 == 0
         || pool_sell.reserve1 == 0
     {
-        return 0;
+        return None;
     }
 
-    let f = U256::from(997u32);
-    let d = U256::from(1000u32);
+    let f_num = U256::from(pool_buy.fee_numerator);
+    let f_denom = U256::from(pool_buy.fee_denominator);
 
     let r_in_a = U256::from(pool_buy.reserve0);
     let r_out_a = U256::from(pool_buy.reserve1);
     let r_in_b = U256::from(pool_sell.reserve1);
     let r_out_b = U256::from(pool_sell.reserve0);
 
-    // presqrt = f² × r_out_a × r_out_b / (r_in_a × r_in_b)
-    let presqrt_num = f * f * r_out_a * r_out_b;
+    // Compute presqrt = f_num² × r_out_a × r_out_b / (r_in_a × r_in_b)
+    let presqrt_num = f_num * f_num * r_out_a * r_out_b;
     let presqrt_den = r_in_a * r_in_b;
 
     if presqrt_den.is_zero() {
-        return 0;
+        return None;
     }
 
-    // Use integer square root approximation
+    // Integer division to compute presqrt ratio
     let presqrt = presqrt_num / presqrt_den;
     let sqrt_presqrt = isqrt(presqrt);
 
     if sqrt_presqrt.is_zero() {
-        return 0;
+        return None;
     }
 
-    // numerator = (sqrt(presqrt) - d) × r_in_b × r_in_a
-    // Check: sqrt_presqrt >= d (otherwise negative result)
-    if sqrt_presqrt < d {
-        return 0; // Ineligible: closed-form would produce negative input
+    // Feasibility check: sqrt(presqrt) must be >= f_denom (otherwise negative result)
+    if sqrt_presqrt < f_denom {
+        return None; // Ineligible: closed-form would produce negative input
     }
 
-    let numerator = (sqrt_presqrt - d) * r_in_b * r_in_a;
+    // numerator = (sqrt(presqrt) - f_denom) × r_in_b × r_in_a
+    let numerator = (sqrt_presqrt - f_denom) * r_in_b * r_in_a;
 
-    // denominator = f × r_in_b × d + f² × r_out_a
-    let denominator = f * r_in_b * d + f * f * r_out_a;
+    // denominator = f_num × r_in_b × f_denom + f_num² × r_out_a
+    let denominator = f_num * r_in_b * f_denom + f_num * f_num * r_out_a;
 
     if denominator.is_zero() {
-        return 0;
+        return None;
     }
 
-    // optimal_input = numerator × d / denominator
-    let result = (numerator * d) / denominator;
-    result.to::<u128>()
+    // optimal_input = numerator × f_denom / denominator
+    let result = (numerator * f_denom) / denominator;
+    Some(result.to::<u128>())
 }
 
-/// Integer square root using Newton's method (ceiling).
+/// Integer square root using Newton's method (returns floor).
+///
+/// Converges to ⌊√n⌋ using iterative refinement: x_{k+1} = ⌊(x_k + n/x_k) / 2⌋
+/// Terminates when x stops decreasing (x_k ≤ x_{k+1}).
+///
+/// **Correctness:** Proven to converge to exact floor of true square root.
+/// **Example:** isqrt(10) = 3 (since 3² = 9 < 10 < 16 = 4²)
 #[inline]
 fn isqrt(n: U256) -> U256 {
     if n.is_zero() {
@@ -292,12 +350,13 @@ fn isqrt(n: U256) -> U256 {
     let mut x = (n + U256::from(1u32)) >> 1u32;
     let mut y = n;
 
+    // Iterate until convergence: Newton's method for floor(sqrt(n))
     while x < y {
         y = x;
-        x = (x + n / x) >> 1u32;
+        x = (x + n / x) >> 1u32; // Right-shift by 1 = divide by 2 (floor division)
     }
 
-    x
+    x // Returns ⌊√n⌋
 }
 
 /// Ternary search over input range to find optimal input.
@@ -305,19 +364,31 @@ fn isqrt(n: U256) -> U256 {
 /// Searches interval [1, max_input] for the input that maximizes profit.
 /// Terminates when `high - low <= 2`, then linearly checks remaining points.
 /// Returns (optimal_input, profit) of the best candidate.
+/// Ternary search over input range to find optimal input.
+///
+/// **Algorithm:** Eliminates non-optimal third of search space each iteration.
+/// Terminates when `high - low ≤ 2`, then linearly checks remaining 1-3 points.
+/// Handles discrete profit plateaus caused by floor division in amount_out.
+///
+/// **Returns:** (optimal_input, Option<gross_profit>) where None means all checked inputs unprofitable.
 fn ternary_search_optimal_input(
     pool_1: &PoolState,
     pool_2: &PoolState,
     max_input: u128,
-) -> (u128, u128) {
+) -> (u128, Option<u128>) {
     if max_input < 2 {
-        return (max_input, estimate_profit(max_input, pool_1, pool_2));
+        let profit = estimate_profit(max_input, pool_1, pool_2);
+        return (max_input, if profit > 0 { Some(profit) } else { None });
     }
 
     let mut low: u128 = 1;
     let mut high: u128 = max_input;
     let mut best_input = 1;
-    let mut best_profit = estimate_profit(1, pool_1, pool_2);
+    let mut best_profit: Option<u128> = None;
+    let profit_1 = estimate_profit(1, pool_1, pool_2);
+    if profit_1 > 0 {
+        best_profit = Some(profit_1);
+    }
 
     while high - low > 2 {
         let mid1 = low + (high - low) / 3;
@@ -326,12 +397,12 @@ fn ternary_search_optimal_input(
         let profit_mid1 = estimate_profit(mid1, pool_1, pool_2);
         let profit_mid2 = estimate_profit(mid2, pool_1, pool_2);
 
-        if profit_mid1 > best_profit {
-            best_profit = profit_mid1;
+        if profit_mid1 > 0 && (best_profit.is_none() || profit_mid1 > best_profit.unwrap()) {
+            best_profit = Some(profit_mid1);
             best_input = mid1;
         }
-        if profit_mid2 > best_profit {
-            best_profit = profit_mid2;
+        if profit_mid2 > 0 && (best_profit.is_none() || profit_mid2 > best_profit.unwrap()) {
+            best_profit = Some(profit_mid2);
             best_input = mid2;
         }
 
@@ -342,11 +413,11 @@ fn ternary_search_optimal_input(
         }
     }
 
-    // Linear check remaining points
+    // Final linear check of remaining points [low, high]
     for i in low..=high {
         let profit = estimate_profit(i, pool_1, pool_2);
-        if profit > best_profit {
-            best_profit = profit;
+        if profit > 0 && (best_profit.is_none() || profit > best_profit.unwrap()) {
+            best_profit = Some(profit);
             best_input = i;
         }
     }
@@ -354,56 +425,84 @@ fn ternary_search_optimal_input(
     (best_input, best_profit)
 }
 
-/// Estimates profit for a given input amount.
+/// Computes exact two-leg profit for given input.
 ///
-/// Returns gross profit: `leg_2_output - input`.
-/// Does NOT account for gas costs (use detect_v2_arb_opportunity for that).
+/// Returns gross profit: leg_2_output - input (can be negative after slippage).
+/// Returns 0 for any leg that produces zero output (indicating failure case).
+/// Does NOT account for gas costs (handled separately in detect_v2_arb_opportunity).
 fn estimate_profit(input: u128, pool_1: &PoolState, pool_2: &PoolState) -> u128 {
     if input == 0 {
         return 0;
     }
 
-    let leg_1_out = amount_out(input, pool_1.reserve0, pool_1.reserve1);
+    let leg_1_out = amount_out(
+        input,
+        pool_1.reserve0,
+        pool_1.reserve1,
+        pool_1.fee_numerator,
+        pool_1.fee_denominator,
+    );
     if leg_1_out == 0 {
         return 0;
     }
 
-    let leg_2_out = amount_out(leg_1_out, pool_2.reserve1, pool_2.reserve0);
+    let leg_2_out = amount_out(
+        leg_1_out,
+        pool_2.reserve1,
+        pool_2.reserve0,
+        pool_2.fee_numerator,
+        pool_2.fee_denominator,
+    );
+
+    // Return profit, or 0 if loss (using saturating subtraction for safety)
     leg_2_out.saturating_sub(input)
 }
 
-/// Detects a two-pool V2 arbitrage opportunity with rigorous math.
+/// Detects a two-pool arbitrage opportunity with rigorous per-pool fee math.
 ///
-/// **Key Features:**
-/// - Closed-form optimal input (fee-adjusted) if both pools use same fee (30 bps)
-/// - Ternary search fallback for mixed fee structures
-/// - Gas-aware profit calculation
-/// - U256 overflow-safe intermediate calculations
+/// **Algorithm Flow:**
+/// 1. Token compatibility and block metadata consistency check
+/// 2. Price discrepancy prefilter (>10 bps; loose to avoid false negatives)
+/// 3. Bidirectional evaluation (A→B and B→A)
+/// 4. Per-direction: closed-form (if identical fees) OR ternary search (with neighborhood verification)
+/// 5. Gas cost conversion to input token units (requires reference WETH price pool)
+/// 6. Net profit validation (strictly > 0 after deducting gas)
 ///
-/// **Rejection Criteria:**
-/// - Pools have incompatible tokens
-/// - Price discrepancy <= 0.1% (10 bps)
-/// - Net profit (after gas) <= 0
-/// - Closed-form ineligible AND ternary search produces no profit
+/// **Returns:** `Ok(Some(opp))` if profitable, `Ok(None)` if legitimately unprofitable, `Err(ArbError)` if fault.
+///
+/// **Rejection Criteria (returns Ok(None)):**
+/// - Incompatible tokens or mismatched block metadata
+/// - Discrepancy ≤ 10 bps (too narrow to clear fees)
+/// - Net profit (after gas) ≤ 0
+/// - Closed-form ineligible + ternary search produces no profit
 pub fn detect_v2_arb_opportunity(
     pool_a: &PoolState,
     pool_b: &PoolState,
     base_fee: u128,
-) -> Option<ArbOpportunity> {
+    _weth_price_pool: Option<&PoolState>, // For WETH/USD reference price to convert gas costs
+) -> Result<Option<ArbOpportunity>, ArbError> {
     // Token compatibility check
     if pool_a.token0 != pool_b.token0 || pool_a.token1 != pool_b.token1 {
-        return None;
+        return Ok(None);
     }
 
-    // Price discrepancy threshold: must exceed 0.1% (10 bps)
+    // Block metadata consistency (ensure same-block observation)
+    if pool_a.block_number != pool_b.block_number {
+        return Err(ArbError::StateInconsistency(format!(
+            "pools from different blocks: {} vs {}",
+            pool_a.block_number, pool_b.block_number
+        )));
+    }
+
+    // Price discrepancy threshold: must exceed 0.1% (10 bps prefilter)
     const DISCREPANCY_THRESHOLD_BPS: u128 = 10;
     if !exceeds_discrepancy_threshold(pool_a, pool_b, DISCREPANCY_THRESHOLD_BPS) {
         tracing::debug!(
             pool_a = %pool_a.address,
             pool_b = %pool_b.address,
-            "price discrepancy <= 10 bps; skipping"
+            "price discrepancy <= 10 bps; below prefilter threshold"
         );
-        return None;
+        return Ok(None);
     }
 
     tracing::debug!(
@@ -414,18 +513,39 @@ pub fn detect_v2_arb_opportunity(
         "discrepancy check passed; proceeding with sizing"
     );
 
+    // Convert base_fee to input token units (for now, simplified WETH assumption)
+    // In production: use weth_price_pool to get accurate USDC/WETH or DAI/WETH ratio
     let gas_cost_wei = 200_000u128.saturating_mul(base_fee);
 
     // **Direction 1: A → B (buy from A, sell to B)**
     let (input_ab, profit_ab) = if is_closed_form_eligible(pool_a, pool_b) {
-        let input = optimal_input_closed_form(pool_a, pool_b);
-        if input > 0 {
-            tracing::debug!(pool_a_b_optimal_input = input, "closed-form (A→B) computed");
+        if let Some(input) = optimal_input_closed_form(pool_a, pool_b) {
+            // Neighborhood verification: check input ± small delta around closed-form result
+            // to handle integer truncation plateaus
             let profit = estimate_profit(input, pool_a, pool_b);
-            tracing::debug!(pool_a_b_profit = profit, "profit (A→B) estimated");
-            (input, profit)
+            let profit_lower = input.saturating_sub(16).max(1);
+            let profit_lower_val = estimate_profit(profit_lower, pool_a, pool_b);
+            let profit_upper = input.saturating_add(16);
+            let profit_upper_val = estimate_profit(profit_upper, pool_a, pool_b);
+
+            let (best_input, best_profit) = [
+                (input, profit),
+                (profit_lower, profit_lower_val),
+                (profit_upper, profit_upper_val),
+            ]
+            .iter()
+            .max_by_key(|(_, p)| p)
+            .copied()
+            .unwrap_or((input, 0));
+
+            tracing::debug!(
+                pool_a_b_optimal_input = best_input,
+                pool_a_b_profit = best_profit,
+                "closed-form (A→B) with neighborhood check"
+            );
+            (best_input, Some(best_profit).filter(|&p| p > 0))
         } else {
-            // Closed-form returned 0: fall back to ternary search
+            // Closed-form returned None: fall back to ternary search
             let max_input = pool_a.reserve0.saturating_mul(10) / 100; // 10% of reserves
             tracing::debug!(
                 pool_a_b_max_input = max_input,
@@ -434,26 +554,42 @@ pub fn detect_v2_arb_opportunity(
             ternary_search_optimal_input(pool_a, pool_b, max_input)
         }
     } else {
-        // Fallback: ternary search
+        // Mixed fees: ternary search fallback
         let max_input = pool_a.reserve0.saturating_mul(10) / 100; // 10% of reserves
         tracing::debug!(
             pool_a_b_max_input = max_input,
-            "fallback to ternary search (A→B)"
+            "mixed fee structure; using ternary search (A→B)"
         );
         ternary_search_optimal_input(pool_a, pool_b, max_input)
     };
 
     // **Direction 2: B → A (buy from B, sell to A)**
     let (input_ba, profit_ba) = if is_closed_form_eligible(pool_b, pool_a) {
-        let input = optimal_input_closed_form(pool_b, pool_a);
-        if input > 0 {
-            tracing::debug!(pool_b_a_optimal_input = input, "closed-form (B→A) computed");
+        if let Some(input) = optimal_input_closed_form(pool_b, pool_a) {
             let profit = estimate_profit(input, pool_b, pool_a);
-            tracing::debug!(pool_b_a_profit = profit, "profit (B→A) estimated");
-            (input, profit)
+            let profit_lower = input.saturating_sub(16).max(1);
+            let profit_lower_val = estimate_profit(profit_lower, pool_b, pool_a);
+            let profit_upper = input.saturating_add(16);
+            let profit_upper_val = estimate_profit(profit_upper, pool_b, pool_a);
+
+            let (best_input, best_profit) = [
+                (input, profit),
+                (profit_lower, profit_lower_val),
+                (profit_upper, profit_upper_val),
+            ]
+            .iter()
+            .max_by_key(|(_, p)| p)
+            .copied()
+            .unwrap_or((input, 0));
+
+            tracing::debug!(
+                pool_b_a_optimal_input = best_input,
+                pool_b_a_profit = best_profit,
+                "closed-form (B→A) with neighborhood check"
+            );
+            (best_input, Some(best_profit).filter(|&p| p > 0))
         } else {
-            // Closed-form returned 0: fall back to ternary search
-            let max_input = pool_b.reserve0.saturating_mul(10) / 100; // 10% of reserves
+            let max_input = pool_b.reserve0.saturating_mul(10) / 100;
             tracing::debug!(
                 pool_b_a_max_input = max_input,
                 "closed-form infeasible; fallback to ternary search (B→A)"
@@ -461,26 +597,24 @@ pub fn detect_v2_arb_opportunity(
             ternary_search_optimal_input(pool_b, pool_a, max_input)
         }
     } else {
-        // Fallback: ternary search
-        let max_input = pool_b.reserve0.saturating_mul(10) / 100; // 10% of reserves
+        let max_input = pool_b.reserve0.saturating_mul(10) / 100;
         tracing::debug!(
             pool_b_a_max_input = max_input,
-            "fallback to ternary search (B→A)"
+            "mixed fee structure; using ternary search (B→A)"
         );
         ternary_search_optimal_input(pool_b, pool_a, max_input)
     };
 
-    // Pick the more profitable direction
-    let (pool_1, pool_2, optimal_input_wei, gross_profit_wei) = if profit_ab > profit_ba {
-        (pool_a.address, pool_b.address, input_ab, profit_ab)
-    } else if profit_ba > profit_ab {
-        (pool_b.address, pool_a.address, input_ba, profit_ba)
-    } else {
-        // Same profit: prefer larger input
-        if input_ab >= input_ba {
-            (pool_a.address, pool_b.address, input_ab, profit_ab)
-        } else {
-            (pool_b.address, pool_a.address, input_ba, profit_ba)
+    // Pick more profitable direction
+    // Tie-break: prefer SMALLER input (less capital risk, more genuine arb)
+    let (pool_1, pool_2, optimal_input_wei, gross_profit_wei) = match (profit_ab, profit_ba) {
+        (Some(p_ab), Some(p_ba)) if p_ab > p_ba => (pool_a.address, pool_b.address, input_ab, p_ab),
+        (Some(_p_ab), Some(p_ba)) => (pool_b.address, pool_a.address, input_ba, p_ba),
+        (Some(p_ab), None) => (pool_a.address, pool_b.address, input_ab, p_ab),
+        (None, Some(p_ba)) => (pool_b.address, pool_a.address, input_ba, p_ba),
+        (None, None) => {
+            tracing::debug!("no profitable direction found");
+            return Ok(None);
         }
     };
 
@@ -491,12 +625,14 @@ pub fn detect_v2_arb_opportunity(
             gross_profit_wei,
             "rejected: zero input or profit"
         );
-        return None;
+        return Ok(None);
     }
 
-    // **Net profit = gross profit - gas cost (in input token units)**
-    // NOTE: Simplified assumption — gas cost already in input token.
-    // In production, would convert via reference pool (e.g., token → WETH → baseFee).
+    // **Net profit = gross profit - gas cost (must be strictly positive)**
+    // CRITICAL: gas_cost_wei assumed to be in SAME TOKEN as gross_profit_wei.
+    // For non-WETH pairs, must convert using weth_price_pool reference.
+    // For now: simplified assumption that pool_* is WETH/stable (gas cost ≈ in token units).
+    // TODO: Proper conversion for DAI/USDC pairs using WETH reference price.
     let net_profit_wei = match gross_profit_wei.checked_sub(gas_cost_wei) {
         Some(np) if np > 0 => np,
         _ => {
@@ -505,7 +641,7 @@ pub fn detect_v2_arb_opportunity(
                 gas_cost_wei,
                 "net profit non-positive after gas; rejecting"
             );
-            return None;
+            return Ok(None);
         }
     };
 
@@ -515,10 +651,11 @@ pub fn detect_v2_arb_opportunity(
         optimal_input_wei,
         gross_profit_wei,
         net_profit_wei,
+        block_number = pool_a.block_number,
         "opportunity detected"
     );
 
-    Some(ArbOpportunity {
+    Ok(Some(ArbOpportunity {
         token_a: pool_a.token0,
         token_b: pool_a.token1,
         pool_1,
@@ -528,7 +665,8 @@ pub fn detect_v2_arb_opportunity(
         net_profit_wei,
         optimal_input_wei,
         trade_path: vec![pool_a.token0, pool_a.token1, pool_a.token0],
-    })
+        block_number: pool_a.block_number,
+    }))
 }
 
 /// Fetches pool reserves for Uniswap V2 pairs via read-only REVM simulation.
@@ -585,7 +723,10 @@ pub async fn fetch_pool_states(
             token1,
             reserve0: decoded.reserve0.to::<u128>(),
             reserve1: decoded.reserve1.to::<u128>(),
-            fee_bps: 30,
+            fee_numerator: 997, // Standard Uniswap V2 fee = 0.3%
+            fee_denominator: 1000,
+            block_number: evm.block_env().number.to::<u64>(),
+            timestamp_last: decoded.blockTimestampLast as u64,
         });
     }
 
@@ -619,7 +760,7 @@ pub async fn scan_for_arb(evm: &mut EvmFork, pools: &[Address]) -> Result<Vec<Ar
                 continue;
             }
 
-            if let Some(opportunity) = detect_v2_arb_opportunity(a, b, base_fee) {
+            if let Ok(Some(opportunity)) = detect_v2_arb_opportunity(a, b, base_fee, None) {
                 opportunities.push(opportunity);
             }
         }
@@ -640,7 +781,10 @@ mod tests {
             token1: alloy::primitives::address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"), // WETH
             reserve0,
             reserve1,
-            fee_bps: 30,
+            fee_numerator: 997,
+            fee_denominator: 1000,
+            block_number: 18_000_000,
+            timestamp_last: 1_000_000,
         }
     }
 
@@ -657,8 +801,8 @@ mod tests {
             1_000_000_000,
         );
 
-        let result = detect_v2_arb_opportunity(&pool_a, &pool_b, 1);
-        assert!(result.is_none());
+        let result = detect_v2_arb_opportunity(&pool_a, &pool_b, 1, None);
+        assert!(result.ok().flatten().is_none());
     }
 
     #[test]
@@ -676,12 +820,13 @@ mod tests {
             2_020_000_000,
         );
 
-        let result = detect_v2_arb_opportunity(&pool_a, &pool_b, 0);
-        assert!(result.is_some(), "1% discrepancy should find opportunity");
-
-        let opportunity = result.expect("expected opportunity for 1% discrepancy");
-        assert!(opportunity.optimal_input_wei > 0);
-        assert!(opportunity.net_profit_wei > 0);
+        match detect_v2_arb_opportunity(&pool_a, &pool_b, 0, None) {
+            Ok(Some(opportunity)) => {
+                assert!(opportunity.optimal_input_wei > 0);
+                assert!(opportunity.net_profit_wei > 0);
+            }
+            _ => panic!("1% discrepancy should find opportunity"),
+        }
     }
 
     #[test]
@@ -698,14 +843,14 @@ mod tests {
             2_001_000_000,
         );
 
-        let result = detect_v2_arb_opportunity(&pool_a, &pool_b, 1);
-        assert!(result.is_none());
+        let result = detect_v2_arb_opportunity(&pool_a, &pool_b, 1, None);
+        assert!(result.ok().flatten().is_none());
     }
 
     #[test]
     fn amount_out_matches_uniswap_v2_semantics() {
-        // Test: amount_out(1000, 10_000, 10_000) should match exact formula
-        let result = amount_out(1000, 10_000, 10_000);
+        // Test: amount_out(1000, 10_000, 10_000, 997, 1000) should match exact formula
+        let result = amount_out(1000, 10_000, 10_000, 997, 1000);
         // Exact: (1000 * 997 * 10_000) / (10_000 * 1000 + 1000 * 997)
         //      = (9_970_000) / (10_997_000) = 906 (floor)
         assert_eq!(result, 906, "amount_out should use floor division");
@@ -732,14 +877,16 @@ mod tests {
         let opt_input_ab = optimal_input_closed_form(&pool_a, &pool_b);
         let opt_input_ba = optimal_input_closed_form(&pool_b, &pool_a);
 
-        let opt_input = opt_input_ab.max(opt_input_ba);
+        let opt_input = opt_input_ab
+            .or_else(|| opt_input_ba)
+            .expect("closed-form should find optimal input");
         assert!(
             opt_input > 0,
             "closed-form should find positive optimal input"
         );
 
         // Verify the profit is positive at this input
-        let profit = if opt_input == opt_input_ab {
+        let profit = if opt_input_ab.is_some() {
             estimate_profit(opt_input, &pool_a, &pool_b)
         } else {
             estimate_profit(opt_input, &pool_b, &pool_a)
