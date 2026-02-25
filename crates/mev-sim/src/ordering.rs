@@ -200,9 +200,7 @@ pub async fn order_by_profit(
             continue;
         }
 
-        let gas_fees_to_coinbase = (sim.gas_used as u128).saturating_mul(sim.effective_gas_price);
-        let total_value = gas_fees_to_coinbase.saturating_add(sim.coinbase_payment);
-        scored.push((tx, total_value));
+        scored.push((tx, sim.coinbase_payment));
     }
 
     scored.sort_by(|a, b| b.1.cmp(&a.1));

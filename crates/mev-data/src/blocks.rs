@@ -77,7 +77,11 @@ impl BlockFetcher {
     ) -> Result<Option<(Block, Vec<BlockTransaction>)>> {
         let block = self
             .retry("fetch block", || async {
-                let _permit = self.semaphore.acquire().await.wrap_err("semaphore closed")?;
+                let _permit = self
+                    .semaphore
+                    .acquire()
+                    .await
+                    .wrap_err("semaphore closed")?;
                 self.provider
                     .get_block_by_number(BlockNumberOrTag::Number(block_number))
                     .full()
@@ -96,7 +100,11 @@ impl BlockFetcher {
 
         let receipts = self
             .retry("fetch block receipts", || async {
-                let _permit = self.semaphore.acquire().await.wrap_err("semaphore closed")?;
+                let _permit = self
+                    .semaphore
+                    .acquire()
+                    .await
+                    .wrap_err("semaphore closed")?;
                 self.provider
                     .get_block_receipts(BlockId::number(block_number))
                     .await

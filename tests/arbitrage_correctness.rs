@@ -16,7 +16,7 @@ mod arbitrage_correctness {
         // Convert fee_bps to numerator/denominator (standard V2 = 997/1000)
         let (fee_numerator, fee_denominator) = match fee_bps {
             30 => (997, 1000),                  // 0.3% fee (standard Uniswap V2)
-            25 => (9975, 10000),                // 0.25% fee (SushiSwap V2)
+            25 => (9975, 10000),                // 0.25% fee (custom V2 fork example)
             _ => (1000 - fee_bps as u32, 1000), // approximate conversion
         };
 
@@ -192,5 +192,41 @@ mod arbitrage_correctness {
             Ok(None) => {}       // Rejected, also fine
             Err(_) => {}         // Error handling, also fine
         }
+    }
+
+    #[test]
+    fn test_requires_reference_pool_for_non_weth_gas_conversion() {
+        let pool_a = PoolState {
+            address: "0xBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+                .parse()
+                .unwrap(),
+            token0: address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"), // USDC
+            token1: address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"), // WETH
+            reserve0: 1_000_000,
+            reserve1: 2_000_000_000,
+            fee_numerator: 997,
+            fee_denominator: 1000,
+            block_number: 18_000_000,
+            timestamp_last: 1_000_000,
+        };
+        let pool_b = PoolState {
+            address: "0xCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+                .parse()
+                .unwrap(),
+            token0: address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"), // USDC
+            token1: address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"), // WETH
+            reserve0: 1_000_000,
+            reserve1: 2_020_000_000,
+            fee_numerator: 997,
+            fee_denominator: 1000,
+            block_number: 18_000_000,
+            timestamp_last: 1_000_000,
+        };
+
+        let result = detect_v2_arb_opportunity(&pool_a, &pool_b, 30_000_000_000, None);
+        assert!(
+            result.is_err(),
+            "missing reference pool should return error"
+        );
     }
 }

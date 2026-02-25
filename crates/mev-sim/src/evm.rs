@@ -206,6 +206,14 @@ impl EvmFork {
         let to = tx
             .to_address
             .as_ref()
+            .and_then(|addr| {
+                let trimmed = addr.trim();
+                if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("0x") {
+                    None
+                } else {
+                    Some(trimmed)
+                }
+            })
             .map(|addr| {
                 addr.trim_start_matches("0x")
                     .parse::<Address>()
@@ -311,7 +319,9 @@ impl EvmFork {
         // For now, compute estimated values
 
         let gas_used = 21000; // Base gas for simple transfer (placeholder)
-        let coinbase_payment = (gas_used as u128) * effective_gas_price;
+        let priority_fee_per_gas =
+            effective_gas_price.saturating_sub(self.block_env.basefee.to::<u128>());
+        let coinbase_payment = (gas_used as u128) * priority_fee_per_gas;
 
         let sim_result = SimResult {
             success: true,
@@ -378,7 +388,9 @@ impl EvmFork {
         // This requires access to mutable Evm with database for state tracking
 
         let gas_used = 21000; // Base gas for simple transfer (placeholder)
-        let coinbase_payment = (gas_used as u128) * effective_gas_price;
+        let priority_fee_per_gas =
+            effective_gas_price.saturating_sub(self.block_env.basefee.to::<u128>());
+        let coinbase_payment = (gas_used as u128) * priority_fee_per_gas;
 
         let sim_result = SimResult {
             success: true,

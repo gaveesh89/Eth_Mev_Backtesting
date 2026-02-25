@@ -60,39 +60,95 @@ pub async fn download_day(date: NaiveDate, data_dir: &Path) -> Result<PathBuf> {
         return Ok(local_path);
     }
 
-    // Build URL: https://mempool-dumpster.flashbots.net/ethereum/mainnet/{YYYY-MM}/transactions/{YYYY-MM-DD}.parquet
+    // Build candidate URLs (current + legacy layout):
+    // - https://mempool-dumpster.flashbots.net/ethereum/mainnet/{YYYY-MM}/{YYYY-MM-DD}.parquet
+    // - https://mempool-dumpster.flashbots.net/ethereum/mainnet/{YYYY-MM}/transactions/{YYYY-MM-DD}.parquet
     let year_month = date.format("%Y-%m").to_string();
     let date_str = date.format("%Y-%m-%d").to_string();
-    let url = format!(
-        "https://mempool-dumpster.flashbots.net/ethereum/mainnet/{}/transactions/{}.parquet",
-        year_month, date_str
-    );
-
-    tracing::info!(url = %url, "downloading mempool-dumpster parquet");
+    let candidate_urls = [
+        format!(
+            "https://mempool-dumpster.flashbots.net/ethereum/mainnet/{}/{}.parquet",
+            year_month, date_str
+        ),
+        format!(
+            "https://mempool-dumpster.flashbots.net/ethereum/mainnet/{}/transactions/{}.parquet",
+            year_month, date_str
+        ),
+    ];
 
     // Create async HTTP client
     let client = reqwest::Client::new();
 
-    // Send GET request with timeout
-    let response = client
-        .get(&url)
-        .timeout(std::time::Duration::from_secs(300)) // 5 minute timeout for large files
-        .send()
-        .await
-        .wrap_err_with(|| format!("failed to download from {}", url))?;
+    // Try candidate URLs until one succeeds
+    let mut selected_url: Option<String> = None;
+    let mut response_opt = None;
+    let mut last_error: Option<eyre::Report> = None;
 
-    // Get total file size for progress bar
-    let total_size = response
-        .content_length()
-        .ok_or_else(|| eyre::eyre!("flashbots response missing content-length header"))?;
+    for url in &candidate_urls {
+        tracing::info!(url = %url, "attempting mempool-dumpster parquet download");
 
-    // Initialize progress bar
-    let progress_bar = ProgressBar::new(total_size);
-    progress_bar.set_style(
-        indicatif::ProgressStyle::default_bar()
-            .template("{spinner:.green} [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")
-            .wrap_err("invalid progress bar template")?,
-    );
+        let response = match client
+            .get(url)
+            .timeout(std::time::Duration::from_secs(300))
+            .send()
+            .await
+        {
+            Ok(resp) => resp,
+            Err(error) => {
+                last_error =
+                    Some(eyre::eyre!(error).wrap_err(format!("failed to download from {}", url)));
+                continue;
+            }
+        };
+
+        if response.status().is_success() {
+            selected_url = Some(url.clone());
+            response_opt = Some(response);
+            break;
+        }
+
+        last_error = Some(
+            eyre::eyre!("HTTP status {}", response.status()).wrap_err(format!(
+                "mempool-dumpster returned error status for {}",
+                url
+            )),
+        );
+    }
+
+    let response = match response_opt {
+        Some(resp) => resp,
+        None => {
+            return Err(last_error
+                .unwrap_or_else(|| eyre::eyre!("no mempool-dumpster URL candidates succeeded")));
+        }
+    };
+
+    let selected_url = selected_url.unwrap_or_else(|| "<unknown>".to_string());
+
+    // content-length can be absent on some CDN responses; fall back to spinner.
+    let total_size = response.content_length();
+
+    let progress_bar = match total_size {
+        Some(size) => {
+            let pb = ProgressBar::new(size);
+            pb.set_style(
+                indicatif::ProgressStyle::default_bar()
+                    .template("{spinner:.green} [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")
+                    .wrap_err("invalid progress bar template")?,
+            );
+            pb
+        }
+        None => {
+            let pb = ProgressBar::new_spinner();
+            pb.set_style(
+                indicatif::ProgressStyle::default_spinner()
+                    .template("{spinner:.green} downloading... {bytes}")
+                    .wrap_err("invalid spinner template")?,
+            );
+            pb.enable_steady_tick(std::time::Duration::from_millis(100));
+            pb
+        }
+    };
 
     // Stream response body and write to file
     let mut file = tokio::fs::File::create(&local_path)
@@ -100,8 +156,10 @@ pub async fn download_day(date: NaiveDate, data_dir: &Path) -> Result<PathBuf> {
         .wrap_err_with(|| format!("failed to create file: {}", local_path.display()))?;
 
     let mut stream = response.bytes_stream();
+    let mut downloaded_bytes: u64 = 0;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.wrap_err("failed to read response chunk")?;
+        downloaded_bytes = downloaded_bytes.saturating_add(chunk.len() as u64);
         progress_bar.inc(chunk.len() as u64);
 
         file.write_all(&chunk)
@@ -113,7 +171,8 @@ pub async fn download_day(date: NaiveDate, data_dir: &Path) -> Result<PathBuf> {
 
     tracing::info!(
         path = %local_path.display(),
-        bytes = total_size,
+        url = %selected_url,
+        bytes = downloaded_bytes,
         "mempool-dumpster parquet downloaded"
     );
 
@@ -129,11 +188,171 @@ pub async fn download_day(date: NaiveDate, data_dir: &Path) -> Result<PathBuf> {
 /// Returns error if file cannot be opened, Parquet format is invalid,
 /// or schema is missing expected columns.
 pub fn parse_parquet(path: &Path) -> Result<Vec<MempoolTransaction>> {
-    use arrow::array::{Array, StringArray, UInt32Array, UInt64Array};
+    use arrow::array::{
+        Array, BinaryArray, FixedSizeBinaryArray, Int32Array, Int64Array, LargeBinaryArray,
+        LargeStringArray, StringArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+        TimestampNanosecondArray, TimestampSecondArray, UInt32Array, UInt64Array,
+    };
+    use arrow::datatypes::DataType;
     use arrow::record_batch::RecordBatchReader;
     use eyre::ContextCompat;
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use std::fs::File;
+
+    fn col_idx(schema: &arrow::datatypes::Schema, names: &[&str]) -> Result<usize> {
+        for name in names {
+            if let Ok(idx) = schema.index_of(name) {
+                return Ok(idx);
+            }
+        }
+        Err(eyre::eyre!(
+            "none of columns {:?} found in parquet schema",
+            names
+        ))
+    }
+
+    fn array_string(array: &dyn Array, row_idx: usize, label: &str) -> Result<String> {
+        fn to_0x_hex(bytes: &[u8]) -> String {
+            let mut out = String::with_capacity(2 + bytes.len() * 2);
+            out.push_str("0x");
+            for b in bytes {
+                out.push_str(&format!("{b:02x}"));
+            }
+            out
+        }
+
+        if array.is_null(row_idx) {
+            return Ok(String::new());
+        }
+
+        match array.data_type() {
+            DataType::Utf8 => Ok(array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .context(format!("{label} column not Utf8"))?
+                .value(row_idx)
+                .to_string()),
+            DataType::LargeUtf8 => Ok(array
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .context(format!("{label} column not LargeUtf8"))?
+                .value(row_idx)
+                .to_string()),
+            DataType::Binary => Ok(to_0x_hex(
+                array
+                    .as_any()
+                    .downcast_ref::<BinaryArray>()
+                    .context(format!("{label} column not Binary"))?
+                    .value(row_idx),
+            )),
+            DataType::LargeBinary => Ok(to_0x_hex(
+                array
+                    .as_any()
+                    .downcast_ref::<LargeBinaryArray>()
+                    .context(format!("{label} column not LargeBinary"))?
+                    .value(row_idx),
+            )),
+            DataType::FixedSizeBinary(_) => Ok(to_0x_hex(
+                array
+                    .as_any()
+                    .downcast_ref::<FixedSizeBinaryArray>()
+                    .context(format!("{label} column not FixedSizeBinary"))?
+                    .value(row_idx),
+            )),
+            DataType::UInt64 => Ok(array
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .context(format!("{label} column not UInt64"))?
+                .value(row_idx)
+                .to_string()),
+            DataType::UInt32 => Ok(array
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .context(format!("{label} column not UInt32"))?
+                .value(row_idx)
+                .to_string()),
+            DataType::Int64 => Ok(array
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .context(format!("{label} column not Int64"))?
+                .value(row_idx)
+                .to_string()),
+            DataType::Int32 => Ok(array
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .context(format!("{label} column not Int32"))?
+                .value(row_idx)
+                .to_string()),
+            DataType::Timestamp(_, _) => {
+                if let Some(col) = array.as_any().downcast_ref::<TimestampMillisecondArray>() {
+                    return Ok(col.value(row_idx).to_string());
+                }
+                if let Some(col) = array.as_any().downcast_ref::<TimestampMicrosecondArray>() {
+                    return Ok(col.value(row_idx).to_string());
+                }
+                if let Some(col) = array.as_any().downcast_ref::<TimestampNanosecondArray>() {
+                    return Ok(col.value(row_idx).to_string());
+                }
+                if let Some(col) = array.as_any().downcast_ref::<TimestampSecondArray>() {
+                    return Ok(col.value(row_idx).to_string());
+                }
+                Err(eyre::eyre!("unsupported timestamp storage for {label}"))
+            }
+            other => Err(eyre::eyre!("unsupported datatype for {label}: {:?}", other)),
+        }
+    }
+
+    fn array_u64_opt(array: &dyn Array, row_idx: usize, label: &str) -> Result<Option<u64>> {
+        if array.is_null(row_idx) {
+            return Ok(None);
+        }
+
+        match array.data_type() {
+            DataType::UInt64 => Ok(Some(
+                array
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .context(format!("{label} column not UInt64"))?
+                    .value(row_idx),
+            )),
+            DataType::UInt32 => Ok(Some(
+                array
+                    .as_any()
+                    .downcast_ref::<UInt32Array>()
+                    .context(format!("{label} column not UInt32"))?
+                    .value(row_idx) as u64,
+            )),
+            DataType::Int64 => Ok(Some(
+                array
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .context(format!("{label} column not Int64"))?
+                    .value(row_idx) as u64,
+            )),
+            DataType::Int32 => Ok(Some(
+                array
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .context(format!("{label} column not Int32"))?
+                    .value(row_idx) as u64,
+            )),
+            DataType::Utf8 | DataType::LargeUtf8 => {
+                let s = array_string(array, row_idx, label)?;
+                let parsed = s.parse::<u64>().wrap_err_with(|| {
+                    format!("failed to parse {label} as u64 from string value: {s}")
+                })?;
+                Ok(Some(parsed))
+            }
+            DataType::Timestamp(_, _) => {
+                let ts = array_string(array, row_idx, label)?;
+                let parsed = ts
+                    .parse::<u64>()
+                    .wrap_err_with(|| format!("failed to parse {label} timestamp as u64: {ts}"))?;
+                Ok(Some(parsed))
+            }
+            other => Err(eyre::eyre!("unsupported datatype for {label}: {:?}", other)),
+        }
+    }
 
     let file = File::open(path)
         .wrap_err_with(|| format!("failed to open parquet file: {}", path.display()))?;
@@ -147,27 +366,25 @@ pub fn parse_parquet(path: &Path) -> Result<Vec<MempoolTransaction>> {
 
     let schema = reader.schema();
 
-    // Get column indices by name (handle potential variations)
-    let col_idx = |name: &str| -> Result<usize> {
-        schema
-            .index_of(name)
-            .context(format!("column {} not found in parquet schema", name))
-    };
-
-    let hash_idx = col_idx("hash")?;
-    let block_number_idx = col_idx("block_number")?;
-    let timestamp_ms_idx = col_idx("timestamp_ms")?;
-    let from_address_idx = col_idx("from_address")?;
-    let to_address_idx = col_idx("to_address")?;
-    let value_idx = col_idx("value")?;
-    let gas_limit_idx = col_idx("gas_limit")?;
-    let gas_price_idx = col_idx("gas_price")?;
-    let max_fee_per_gas_idx = col_idx("max_fee_per_gas")?;
-    let max_priority_fee_per_gas_idx = col_idx("max_priority_fee_per_gas")?;
-    let nonce_idx = col_idx("nonce")?;
-    let input_data_idx = col_idx("input_data")?;
-    let tx_type_idx = col_idx("tx_type")?;
-    let raw_tx_idx = col_idx("raw_tx")?;
+    // Legacy schema aliases + current mempool-dumpster schema aliases.
+    let hash_idx = col_idx(&schema, &["hash"])?;
+    let block_number_idx = col_idx(&schema, &["block_number", "includedAtBlockHeight"])?;
+    let timestamp_ms_idx = col_idx(
+        &schema,
+        &["timestamp_ms", "timestamp", "includedBlockTimestamp"],
+    )?;
+    let from_address_idx = col_idx(&schema, &["from_address", "from"])?;
+    let to_address_idx = col_idx(&schema, &["to_address", "to"])?;
+    let value_idx = col_idx(&schema, &["value"])?;
+    let gas_limit_idx = col_idx(&schema, &["gas_limit", "gas"])?;
+    let gas_price_idx = col_idx(&schema, &["gas_price", "gasPrice"])?;
+    let max_fee_per_gas_idx = col_idx(&schema, &["max_fee_per_gas", "gasFeeCap"])?;
+    let max_priority_fee_per_gas_idx =
+        col_idx(&schema, &["max_priority_fee_per_gas", "gasTipCap"])?;
+    let nonce_idx = col_idx(&schema, &["nonce"])?;
+    let input_data_idx = col_idx(&schema, &["input_data", "data", "data4Bytes"])?;
+    let tx_type_idx = col_idx(&schema, &["tx_type", "txType"])?;
+    let raw_tx_idx = col_idx(&schema, &["raw_tx", "rawTx"])?;
 
     let mut txs = Vec::new();
 
@@ -175,116 +392,55 @@ pub fn parse_parquet(path: &Path) -> Result<Vec<MempoolTransaction>> {
     for batch_result in reader {
         let batch = batch_result.wrap_err("failed to read record batch")?;
 
-        // Extract columns from batch
-        let hash_col = batch
-            .column(hash_idx)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .context("hash column is not string type")?;
-
-        let block_number_col = batch
-            .column(block_number_idx)
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .context("block_number column is not u64 type")?;
-
-        let timestamp_ms_col = batch
-            .column(timestamp_ms_idx)
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .context("timestamp_ms column is not u64 type")?;
-
-        let from_address_col = batch
-            .column(from_address_idx)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .context("from_address column is not string type")?;
-
-        let to_address_col = batch
-            .column(to_address_idx)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .context("to_address column is not string type")?;
-
-        let value_col = batch
-            .column(value_idx)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .context("value column is not string type")?;
-
-        let gas_limit_col = batch
-            .column(gas_limit_idx)
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .context("gas_limit column is not u64 type")?;
-
-        let gas_price_col = batch
-            .column(gas_price_idx)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .context("gas_price column is not string type")?;
-
-        let max_fee_per_gas_col = batch
-            .column(max_fee_per_gas_idx)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .context("max_fee_per_gas column is not string type")?;
-
-        let max_priority_fee_per_gas_col = batch
-            .column(max_priority_fee_per_gas_idx)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .context("max_priority_fee_per_gas column is not string type")?;
-
-        let nonce_col = batch
-            .column(nonce_idx)
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .context("nonce column is not u64 type")?;
-
-        let input_data_col = batch
-            .column(input_data_idx)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .context("input_data column is not string type")?;
-
-        let tx_type_col = batch
-            .column(tx_type_idx)
-            .as_any()
-            .downcast_ref::<UInt32Array>()
-            .context("tx_type column is not u32 type")?;
-
-        let raw_tx_col = batch
-            .column(raw_tx_idx)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .context("raw_tx column is not string type")?;
+        let hash_col = batch.column(hash_idx).as_ref();
+        let block_number_col = batch.column(block_number_idx).as_ref();
+        let timestamp_ms_col = batch.column(timestamp_ms_idx).as_ref();
+        let from_address_col = batch.column(from_address_idx).as_ref();
+        let to_address_col = batch.column(to_address_idx).as_ref();
+        let value_col = batch.column(value_idx).as_ref();
+        let gas_limit_col = batch.column(gas_limit_idx).as_ref();
+        let gas_price_col = batch.column(gas_price_idx).as_ref();
+        let max_fee_per_gas_col = batch.column(max_fee_per_gas_idx).as_ref();
+        let max_priority_fee_per_gas_col = batch.column(max_priority_fee_per_gas_idx).as_ref();
+        let nonce_col = batch.column(nonce_idx).as_ref();
+        let input_data_col = batch.column(input_data_idx).as_ref();
+        let tx_type_col = batch.column(tx_type_idx).as_ref();
+        let raw_tx_col = batch.column(raw_tx_idx).as_ref();
 
         // Map rows in batch to MempoolTransaction structs
         for row_idx in 0..batch.num_rows() {
+            let tx_type_val = array_u64_opt(tx_type_col, row_idx, "tx_type")?.unwrap_or(0) as u32;
             let tx = MempoolTransaction {
-                hash: hash_col.value(row_idx).to_string(),
-                block_number: if block_number_col.is_null(row_idx) {
-                    None
-                } else {
-                    Some(block_number_col.value(row_idx))
-                },
-                timestamp_ms: timestamp_ms_col.value(row_idx),
-                from_address: from_address_col.value(row_idx).to_string(),
+                hash: array_string(hash_col, row_idx, "hash")?,
+                block_number: array_u64_opt(block_number_col, row_idx, "block_number")?,
+                timestamp_ms: array_u64_opt(timestamp_ms_col, row_idx, "timestamp")?
+                    .unwrap_or_default(),
+                from_address: array_string(from_address_col, row_idx, "from_address")?,
                 to_address: if to_address_col.is_null(row_idx) {
                     None
                 } else {
-                    Some(to_address_col.value(row_idx).to_string())
+                    Some(array_string(to_address_col, row_idx, "to_address")?)
                 },
-                value: value_col.value(row_idx).to_string(),
-                gas_limit: gas_limit_col.value(row_idx),
-                gas_price: gas_price_col.value(row_idx).to_string(),
-                max_fee_per_gas: max_fee_per_gas_col.value(row_idx).to_string(),
-                max_priority_fee_per_gas: max_priority_fee_per_gas_col.value(row_idx).to_string(),
-                nonce: nonce_col.value(row_idx),
-                input_data: input_data_col.value(row_idx).to_string(),
-                tx_type: tx_type_col.value(row_idx),
-                raw_tx: raw_tx_col.value(row_idx).to_string(),
+                value: array_string(value_col, row_idx, "value")?,
+                gas_limit: array_u64_opt(gas_limit_col, row_idx, "gas_limit")?.unwrap_or(0),
+                gas_price: array_string(gas_price_col, row_idx, "gas_price")?,
+                max_fee_per_gas: array_string(max_fee_per_gas_col, row_idx, "max_fee_per_gas")?,
+                max_priority_fee_per_gas: array_string(
+                    max_priority_fee_per_gas_col,
+                    row_idx,
+                    "max_priority_fee_per_gas",
+                )?,
+                nonce: array_u64_opt(nonce_col, row_idx, "nonce")?.unwrap_or(0),
+                input_data: {
+                    let data = array_string(input_data_col, row_idx, "input_data")?;
+                    if data.is_empty() {
+                        "0x".to_string()
+                    } else {
+                        data
+                    }
+                },
+                tx_type: tx_type_val,
+                raw_tx: array_string(raw_tx_col, row_idx, "raw_tx")?,
             };
             txs.push(tx);
         }

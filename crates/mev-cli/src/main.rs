@@ -234,17 +234,18 @@ async fn handle_simulate(ctx: &AppContext, args: SimulateArgs) -> Result<()> {
             (ordered, 0)
         };
 
-        let total_gas: u64 = ordered_txs.iter().map(|tx| tx.gas_limit).sum();
-        let mut estimated_value: u128 = 0;
+        let mut value_evm = EvmFork::at_block(args.block, &block)
+            .wrap_err("failed to create EVM fork for value estimation")?;
+        let mut total_gas = 0_u64;
+        let mut estimated_value = 0_u128;
         for tx in &ordered_txs {
-            let gas_price_str = if tx.tx_type == 2 {
-                &tx.max_fee_per_gas
-            } else {
-                &tx.gas_price
-            };
-            let gas_price = parse_hex_u128(gas_price_str, "gas_price")?;
-            estimated_value =
-                estimated_value.saturating_add((tx.gas_limit as u128).saturating_mul(gas_price));
+            let sim = value_evm
+                .simulate_tx(tx)
+                .wrap_err_with(|| format!("failed to estimate ordered tx {}", tx.hash))?;
+            if sim.success {
+                total_gas = total_gas.saturating_add(sim.gas_used);
+                estimated_value = estimated_value.saturating_add(sim.coinbase_payment);
+            }
         }
 
         // Persistence to SQLite
@@ -611,10 +612,18 @@ fn ensure_dir(path: &Path) -> Result<()> {
 }
 
 fn parse_hex_u128(value: &str, context: &str) -> Result<u128> {
-    let trimmed = value.trim_start_matches("0x");
+    let trimmed = value.trim();
     if trimmed.is_empty() {
         return Ok(0);
     }
-    u128::from_str_radix(trimmed, 16)
-        .wrap_err_with(|| format!("failed to parse hex value for {}: {}", context, value))
+    if let Some(hex) = trimmed.strip_prefix("0x") {
+        if hex.is_empty() {
+            return Ok(0);
+        }
+        return u128::from_str_radix(hex, 16)
+            .wrap_err_with(|| format!("failed to parse hex value for {}: {}", context, value));
+    }
+
+    u128::from_str_radix(trimmed, 10)
+        .wrap_err_with(|| format!("failed to parse decimal value for {}: {}", context, value))
 }

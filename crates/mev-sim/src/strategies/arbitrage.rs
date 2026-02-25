@@ -16,6 +16,10 @@
 //! - Block metadata tracking (block_number, timestamp_last)
 //! - Typed error enum distinguishing faults from rejections
 
+const GAS_ESTIMATE_UNITS: u128 = 200_000;
+const NEIGHBORHOOD_RADIUS: u128 = 16;
+const UNISWAP_V2_MAX_RESERVE: u128 = (1u128 << 112) - 1;
+
 use alloy::hex;
 use alloy::primitives::{Address, U256};
 use alloy::sol;
@@ -298,9 +302,23 @@ fn optimal_input_closed_form(pool_buy: &PoolState, pool_sell: &PoolState) -> Opt
     let r_in_b = U256::from(pool_sell.reserve1);
     let r_out_b = U256::from(pool_sell.reserve0);
 
+    if pool_buy.reserve0 > UNISWAP_V2_MAX_RESERVE
+        || pool_buy.reserve1 > UNISWAP_V2_MAX_RESERVE
+        || pool_sell.reserve0 > UNISWAP_V2_MAX_RESERVE
+        || pool_sell.reserve1 > UNISWAP_V2_MAX_RESERVE
+    {
+        tracing::debug!(
+            "closed-form skipped: reserve exceeds Uniswap V2 uint112 domain; use ternary fallback"
+        );
+        return None;
+    }
+
     // Compute presqrt = f_num² × r_out_a × r_out_b / (r_in_a × r_in_b)
-    let presqrt_num = f_num * f_num * r_out_a * r_out_b;
-    let presqrt_den = r_in_a * r_in_b;
+    let presqrt_num = f_num
+        .checked_mul(f_num)?
+        .checked_mul(r_out_a)?
+        .checked_mul(r_out_b)?;
+    let presqrt_den = r_in_a.checked_mul(r_in_b)?;
 
     if presqrt_den.is_zero() {
         return None;
@@ -320,17 +338,22 @@ fn optimal_input_closed_form(pool_buy: &PoolState, pool_sell: &PoolState) -> Opt
     }
 
     // numerator = (sqrt(presqrt) - f_denom) × r_in_b × r_in_a
-    let numerator = (sqrt_presqrt - f_denom) * r_in_b * r_in_a;
+    let numerator = (sqrt_presqrt - f_denom)
+        .checked_mul(r_in_b)?
+        .checked_mul(r_in_a)?;
 
     // denominator = f_num × r_in_b × f_denom + f_num² × r_out_a
-    let denominator = f_num * r_in_b * f_denom + f_num * f_num * r_out_a;
+    let denominator = f_num
+        .checked_mul(r_in_b)?
+        .checked_mul(f_denom)?
+        .checked_add(f_num.checked_mul(f_num)?.checked_mul(r_out_a)?)?;
 
     if denominator.is_zero() {
         return None;
     }
 
     // optimal_input = numerator × f_denom / denominator
-    let result = (numerator * f_denom) / denominator;
+    let result = numerator.checked_mul(f_denom)? / denominator;
     Some(result.to::<u128>())
 }
 
@@ -356,7 +379,82 @@ fn isqrt(n: U256) -> U256 {
         x = (x + n / x) >> 1u32; // Right-shift by 1 = divide by 2 (floor division)
     }
 
-    x // Returns ⌊√n⌋
+    y // Return the last non-increasing iterate; this is always ⌊√n⌋
+}
+
+#[inline]
+fn best_input_in_neighborhood(
+    center: u128,
+    pool_buy: &PoolState,
+    pool_sell: &PoolState,
+) -> (u128, u128) {
+    let scan_low = center.saturating_sub(NEIGHBORHOOD_RADIUS).max(1);
+    let scan_high = center.saturating_add(NEIGHBORHOOD_RADIUS);
+
+    let mut best_input = center.max(1);
+    let mut best_profit = estimate_profit(best_input, pool_buy, pool_sell);
+
+    for candidate in scan_low..=scan_high {
+        let candidate_profit = estimate_profit(candidate, pool_buy, pool_sell);
+        if candidate_profit > best_profit
+            || (candidate_profit == best_profit && candidate < best_input)
+        {
+            best_input = candidate;
+            best_profit = candidate_profit;
+        }
+    }
+
+    (best_input, best_profit)
+}
+
+#[inline]
+fn convert_eth_wei_to_token0_wei(
+    gas_cost_eth_wei: u128,
+    token0: Address,
+    block_number: u64,
+    weth_price_pool: Option<&PoolState>,
+) -> Result<u128, ArbError> {
+    if gas_cost_eth_wei == 0 {
+        return Ok(0);
+    }
+
+    if token0 == addresses::WETH {
+        return Ok(gas_cost_eth_wei);
+    }
+
+    let reference_pool = weth_price_pool.ok_or(ArbError::MissingReferencePrice)?;
+    if reference_pool.block_number != block_number {
+        return Err(ArbError::StateInconsistency(format!(
+            "reference pool block mismatch: {} vs {}",
+            reference_pool.block_number, block_number
+        )));
+    }
+
+    let converted = if reference_pool.token0 == addresses::WETH && reference_pool.token1 == token0 {
+        amount_out(
+            gas_cost_eth_wei,
+            reference_pool.reserve0,
+            reference_pool.reserve1,
+            reference_pool.fee_numerator,
+            reference_pool.fee_denominator,
+        )
+    } else if reference_pool.token1 == addresses::WETH && reference_pool.token0 == token0 {
+        amount_out(
+            gas_cost_eth_wei,
+            reference_pool.reserve1,
+            reference_pool.reserve0,
+            reference_pool.fee_numerator,
+            reference_pool.fee_denominator,
+        )
+    } else {
+        return Err(ArbError::MissingReferencePrice);
+    };
+
+    if converted == 0 {
+        Ok(1)
+    } else {
+        Ok(converted)
+    }
 }
 
 /// Ternary search over input range to find optimal input.
@@ -397,13 +495,23 @@ fn ternary_search_optimal_input(
         let profit_mid1 = estimate_profit(mid1, pool_1, pool_2);
         let profit_mid2 = estimate_profit(mid2, pool_1, pool_2);
 
-        if profit_mid1 > 0 && (best_profit.is_none() || profit_mid1 > best_profit.unwrap()) {
-            best_profit = Some(profit_mid1);
-            best_input = mid1;
+        if profit_mid1 > 0 {
+            match best_profit {
+                Some(current) if profit_mid1 <= current => {}
+                _ => {
+                    best_profit = Some(profit_mid1);
+                    best_input = mid1;
+                }
+            }
         }
-        if profit_mid2 > 0 && (best_profit.is_none() || profit_mid2 > best_profit.unwrap()) {
-            best_profit = Some(profit_mid2);
-            best_input = mid2;
+        if profit_mid2 > 0 {
+            match best_profit {
+                Some(current) if profit_mid2 <= current => {}
+                _ => {
+                    best_profit = Some(profit_mid2);
+                    best_input = mid2;
+                }
+            }
         }
 
         if profit_mid1 > profit_mid2 {
@@ -416,9 +524,14 @@ fn ternary_search_optimal_input(
     // Final linear check of remaining points [low, high]
     for i in low..=high {
         let profit = estimate_profit(i, pool_1, pool_2);
-        if profit > 0 && (best_profit.is_none() || profit > best_profit.unwrap()) {
-            best_profit = Some(profit);
-            best_input = i;
+        if profit > 0 {
+            match best_profit {
+                Some(current) if profit <= current => {}
+                _ => {
+                    best_profit = Some(profit);
+                    best_input = i;
+                }
+            }
         }
     }
 
@@ -472,14 +585,14 @@ fn estimate_profit(input: u128, pool_1: &PoolState, pool_2: &PoolState) -> u128 
 ///
 /// **Rejection Criteria (returns Ok(None)):**
 /// - Incompatible tokens or mismatched block metadata
-/// - Discrepancy ≤ 10 bps (too narrow to clear fees)
+/// - Discrepancy ≤ 10 bps (loose noise prefilter)
 /// - Net profit (after gas) ≤ 0
 /// - Closed-form ineligible + ternary search produces no profit
 pub fn detect_v2_arb_opportunity(
     pool_a: &PoolState,
     pool_b: &PoolState,
     base_fee: u128,
-    _weth_price_pool: Option<&PoolState>, // For WETH/USD reference price to convert gas costs
+    weth_price_pool: Option<&PoolState>,
 ) -> Result<Option<ArbOpportunity>, ArbError> {
     // Token compatibility check
     if pool_a.token0 != pool_b.token0 || pool_a.token1 != pool_b.token1 {
@@ -494,7 +607,8 @@ pub fn detect_v2_arb_opportunity(
         )));
     }
 
-    // Price discrepancy threshold: must exceed 0.1% (10 bps prefilter)
+    // Price discrepancy threshold: loose prefilter to remove near-parity noise.
+    // Actual profitability is decided by full two-leg simulation + gas conversion.
     const DISCREPANCY_THRESHOLD_BPS: u128 = 10;
     if !exceeds_discrepancy_threshold(pool_a, pool_b, DISCREPANCY_THRESHOLD_BPS) {
         tracing::debug!(
@@ -513,30 +627,18 @@ pub fn detect_v2_arb_opportunity(
         "discrepancy check passed; proceeding with sizing"
     );
 
-    // Convert base_fee to input token units (for now, simplified WETH assumption)
-    // In production: use weth_price_pool to get accurate USDC/WETH or DAI/WETH ratio
-    let gas_cost_wei = 200_000u128.saturating_mul(base_fee);
+    let gas_cost_eth_wei = GAS_ESTIMATE_UNITS.saturating_mul(base_fee);
+    let gas_cost_wei = convert_eth_wei_to_token0_wei(
+        gas_cost_eth_wei,
+        pool_a.token0,
+        pool_a.block_number,
+        weth_price_pool,
+    )?;
 
     // **Direction 1: A → B (buy from A, sell to B)**
     let (input_ab, profit_ab) = if is_closed_form_eligible(pool_a, pool_b) {
         if let Some(input) = optimal_input_closed_form(pool_a, pool_b) {
-            // Neighborhood verification: check input ± small delta around closed-form result
-            // to handle integer truncation plateaus
-            let profit = estimate_profit(input, pool_a, pool_b);
-            let profit_lower = input.saturating_sub(16).max(1);
-            let profit_lower_val = estimate_profit(profit_lower, pool_a, pool_b);
-            let profit_upper = input.saturating_add(16);
-            let profit_upper_val = estimate_profit(profit_upper, pool_a, pool_b);
-
-            let (best_input, best_profit) = [
-                (input, profit),
-                (profit_lower, profit_lower_val),
-                (profit_upper, profit_upper_val),
-            ]
-            .iter()
-            .max_by_key(|(_, p)| p)
-            .copied()
-            .unwrap_or((input, 0));
+            let (best_input, best_profit) = best_input_in_neighborhood(input, pool_a, pool_b);
 
             tracing::debug!(
                 pool_a_b_optimal_input = best_input,
@@ -566,21 +668,7 @@ pub fn detect_v2_arb_opportunity(
     // **Direction 2: B → A (buy from B, sell to A)**
     let (input_ba, profit_ba) = if is_closed_form_eligible(pool_b, pool_a) {
         if let Some(input) = optimal_input_closed_form(pool_b, pool_a) {
-            let profit = estimate_profit(input, pool_b, pool_a);
-            let profit_lower = input.saturating_sub(16).max(1);
-            let profit_lower_val = estimate_profit(profit_lower, pool_b, pool_a);
-            let profit_upper = input.saturating_add(16);
-            let profit_upper_val = estimate_profit(profit_upper, pool_b, pool_a);
-
-            let (best_input, best_profit) = [
-                (input, profit),
-                (profit_lower, profit_lower_val),
-                (profit_upper, profit_upper_val),
-            ]
-            .iter()
-            .max_by_key(|(_, p)| p)
-            .copied()
-            .unwrap_or((input, 0));
+            let (best_input, best_profit) = best_input_in_neighborhood(input, pool_b, pool_a);
 
             tracing::debug!(
                 pool_b_a_optimal_input = best_input,
@@ -609,7 +697,14 @@ pub fn detect_v2_arb_opportunity(
     // Tie-break: prefer SMALLER input (less capital risk, more genuine arb)
     let (pool_1, pool_2, optimal_input_wei, gross_profit_wei) = match (profit_ab, profit_ba) {
         (Some(p_ab), Some(p_ba)) if p_ab > p_ba => (pool_a.address, pool_b.address, input_ab, p_ab),
-        (Some(_p_ab), Some(p_ba)) => (pool_b.address, pool_a.address, input_ba, p_ba),
+        (Some(p_ab), Some(p_ba)) if p_ba > p_ab => (pool_b.address, pool_a.address, input_ba, p_ba),
+        (Some(p_ab), Some(_p_ba)) => {
+            if input_ab <= input_ba {
+                (pool_a.address, pool_b.address, input_ab, p_ab)
+            } else {
+                (pool_b.address, pool_a.address, input_ba, p_ab)
+            }
+        }
         (Some(p_ab), None) => (pool_a.address, pool_b.address, input_ab, p_ab),
         (None, Some(p_ba)) => (pool_b.address, pool_a.address, input_ba, p_ba),
         (None, None) => {
@@ -629,10 +724,7 @@ pub fn detect_v2_arb_opportunity(
     }
 
     // **Net profit = gross profit - gas cost (must be strictly positive)**
-    // CRITICAL: gas_cost_wei assumed to be in SAME TOKEN as gross_profit_wei.
-    // For non-WETH pairs, must convert using weth_price_pool reference.
-    // For now: simplified assumption that pool_* is WETH/stable (gas cost ≈ in token units).
-    // TODO: Proper conversion for DAI/USDC pairs using WETH reference price.
+    // gas_cost_wei is already denominated in token0 units via same-block WETH reference.
     let net_profit_wei = match gross_profit_wei.checked_sub(gas_cost_wei) {
         Some(np) if np > 0 => np,
         _ => {
@@ -892,5 +984,16 @@ mod tests {
             estimate_profit(opt_input, &pool_b, &pool_a)
         };
         assert!(profit > 0, "profit at optimal input should be positive");
+    }
+
+    #[test]
+    fn isqrt_returns_floor_on_oscillating_inputs() {
+        assert_eq!(isqrt(U256::from(0u8)), U256::from(0u8));
+        assert_eq!(isqrt(U256::from(1u8)), U256::from(1u8));
+        assert_eq!(isqrt(U256::from(3u8)), U256::from(1u8));
+        assert_eq!(isqrt(U256::from(4u8)), U256::from(2u8));
+        assert_eq!(isqrt(U256::from(8u8)), U256::from(2u8));
+        assert_eq!(isqrt(U256::from(9u8)), U256::from(3u8));
+        assert_eq!(isqrt(U256::from(10u8)), U256::from(3u8));
     }
 }

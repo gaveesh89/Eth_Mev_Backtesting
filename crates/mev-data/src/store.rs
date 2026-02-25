@@ -109,10 +109,11 @@ impl Store {
     pub fn insert_mempool_txs(&self, txs: &[MempoolTransaction]) -> Result<usize> {
         let mut conn = self.conn.borrow_mut();
         let tx = conn.transaction()?;
+        let mut inserted_count = 0usize;
         {
             let mut stmt = tx.prepare(
                 "
-                INSERT INTO mempool_transactions (
+                INSERT OR IGNORE INTO mempool_transactions (
                     hash, block_number, timestamp_ms, from_address, to_address, value,
                     gas_limit, gas_price, max_fee_per_gas, max_priority_fee_per_gas,
                     nonce, input_data, tx_type, raw_tx
@@ -121,7 +122,7 @@ impl Store {
             )?;
 
             for t in txs {
-                stmt.execute(rusqlite::params![
+                let affected = stmt.execute(rusqlite::params![
                     t.hash,
                     t.block_number,
                     t.timestamp_ms,
@@ -137,12 +138,12 @@ impl Store {
                     t.tx_type,
                     t.raw_tx,
                 ])?;
+                inserted_count = inserted_count.saturating_add(affected);
             }
         }
 
-        let count = txs.len();
         tx.commit()?;
-        Ok(count)
+        Ok(inserted_count)
     }
 
     /// Insert a single block.
@@ -418,7 +419,17 @@ impl Store {
         mev_captured_wei: &str,
     ) -> Result<()> {
         let now = chrono::Utc::now().to_rfc3339();
-        self.conn.borrow_mut().execute(
+        let conn = self.conn.borrow_mut();
+
+        conn.execute(
+            "
+            DELETE FROM simulation_results
+            WHERE block_number = ? AND ordering_algorithm = ?
+            ",
+            rusqlite::params![block_number, ordering_algorithm],
+        )?;
+
+        conn.execute(
             "
             INSERT INTO simulation_results (
                 block_number, ordering_algorithm, simulated_at, tx_count, gas_used,
