@@ -22,6 +22,7 @@ fn pnl_capture_rate_calculation() {
         simulated_block_value_wei: 800_000_000_000_000_000u128, // 0.8 ETH
         egp_simulated_value_wei: 800_000_000_000_000_000u128,
         profit_simulated_value_wei: 0u128,
+        arbitrage_simulated_value_wei: 0u128,
         mev_captured_wei: 0u128,
         private_flow_estimate_wei: 200_000_000_000_000_000u128, // 0.2 ETH
         value_gap_wei: -200_000_000_000_000_000i128,
@@ -54,6 +55,7 @@ fn range_stats_mean_correct() {
             simulated_block_value_wei: 800_000_000_000_000_000u128,
             egp_simulated_value_wei: 800_000_000_000_000_000u128,
             profit_simulated_value_wei: 0u128,
+            arbitrage_simulated_value_wei: 0u128,
             mev_captured_wei: 0u128,
             private_flow_estimate_wei: 0u128,
             value_gap_wei: 0i128,
@@ -70,6 +72,7 @@ fn range_stats_mean_correct() {
             simulated_block_value_wei: 600_000_000_000_000_000u128,
             egp_simulated_value_wei: 600_000_000_000_000_000u128,
             profit_simulated_value_wei: 0u128,
+            arbitrage_simulated_value_wei: 0u128,
             mev_captured_wei: 0u128,
             private_flow_estimate_wei: 0u128,
             value_gap_wei: 0i128,
@@ -86,6 +89,7 @@ fn range_stats_mean_correct() {
             simulated_block_value_wei: 700_000_000_000_000_000u128,
             egp_simulated_value_wei: 700_000_000_000_000_000u128,
             profit_simulated_value_wei: 0u128,
+            arbitrage_simulated_value_wei: 0u128,
             mev_captured_wei: 0u128,
             private_flow_estimate_wei: 0u128,
             value_gap_wei: 0i128,

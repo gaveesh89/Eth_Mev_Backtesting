@@ -13,6 +13,9 @@ use std::cell::RefCell;
 
 use crate::types::{Block, BlockTransaction, MempoolTransaction};
 
+/// Row type for intra-block DEX-DEX arbitrage: `(block_number, after_tx_index, after_log_index, pool_a, pool_b, spread_bps, profit_wei, direction, verdict)`.
+pub type IntraBlockArbRow = (u64, u64, u64, String, String, i64, String, String, String);
+
 #[allow(dead_code)]
 pub struct Store {
     conn: RefCell<Connection>,
@@ -97,9 +100,147 @@ impl Store {
                 protocol TEXT,
                 details TEXT
             );
+
+            CREATE TABLE IF NOT EXISTS cex_prices (
+                timestamp_s INTEGER PRIMARY KEY,
+                open REAL NOT NULL,
+                close REAL NOT NULL,
+                high REAL NOT NULL,
+                low REAL NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS intra_block_arbs (
+                block_number INTEGER NOT NULL,
+                after_tx_index INTEGER NOT NULL,
+                after_log_index INTEGER NOT NULL,
+                pool_a TEXT NOT NULL,
+                pool_b TEXT NOT NULL,
+                spread_bps INTEGER NOT NULL,
+                profit_wei TEXT NOT NULL,
+                direction TEXT NOT NULL,
+                verdict TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (block_number, after_log_index)
+            );
             ",
         )?;
         Ok(())
+    }
+
+    /// Inserts Binance-derived CEX prices keyed by second timestamp.
+    ///
+    /// Existing rows are replaced for the same timestamp.
+    ///
+    /// # Errors
+    /// Returns error if any database operation fails.
+    pub fn insert_cex_prices(&self, rows: &[(u64, f64, f64, f64, f64)]) -> Result<usize> {
+        let mut conn = self.conn.borrow_mut();
+        let tx = conn.transaction()?;
+        let mut inserted = 0usize;
+        {
+            let mut stmt = tx.prepare(
+                "
+                INSERT OR REPLACE INTO cex_prices (timestamp_s, open, close, high, low)
+                VALUES (?, ?, ?, ?, ?)
+                ",
+            )?;
+
+            for row in rows {
+                let affected =
+                    stmt.execute(rusqlite::params![row.0 as i64, row.1, row.2, row.3, row.4,])?;
+                inserted = inserted.saturating_add(affected);
+            }
+        }
+
+        tx.commit()?;
+        Ok(inserted)
+    }
+
+    /// Returns nearest CEX close price (by absolute second distance) for a block timestamp.
+    ///
+    /// # Errors
+    /// Returns error if database query fails.
+    pub fn get_nearest_cex_close_price(&self, timestamp_s: u64) -> Result<Option<f64>> {
+        let result = self.get_nearest_cex_close_price_point(timestamp_s)?;
+        Ok(result.map(|(_, close)| close))
+    }
+
+    /// Returns nearest CEX close price point (timestamp and close) for a target block timestamp.
+    ///
+    /// # Errors
+    /// Returns error if database query fails.
+    pub fn get_nearest_cex_close_price_point(
+        &self,
+        timestamp_s: u64,
+    ) -> Result<Option<(u64, f64)>> {
+        let conn = self.conn.borrow();
+        let mut stmt = conn.prepare(
+            "
+            SELECT timestamp_s, close
+            FROM cex_prices
+            ORDER BY ABS(timestamp_s - ?) ASC
+            LIMIT 1
+            ",
+        )?;
+
+        let result = stmt.query_row(rusqlite::params![timestamp_s as i64], |row| {
+            let candle_timestamp: i64 = row.get(0)?;
+            let close: f64 = row.get(1)?;
+            Ok((candle_timestamp as u64, close))
+        });
+
+        match result {
+            Ok(point) => Ok(Some(point)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Stores intra-block DEX-DEX arbitrage opportunities for a block scan.
+    ///
+    /// Each row is `(block_number, after_tx_index, after_log_index, pool_a, pool_b, spread_bps, profit_wei, direction, verdict)`.
+    ///
+    /// # Errors
+    /// Returns error if database insert fails.
+    pub fn insert_intra_block_arbs(&self, rows: &[IntraBlockArbRow]) -> Result<usize> {
+        let mut conn = self.conn.borrow_mut();
+        let tx = conn.transaction()?;
+        let mut inserted = 0usize;
+
+        {
+            let mut stmt = tx.prepare(
+                "
+                INSERT OR REPLACE INTO intra_block_arbs (
+                    block_number,
+                    after_tx_index,
+                    after_log_index,
+                    pool_a,
+                    pool_b,
+                    spread_bps,
+                    profit_wei,
+                    direction,
+                    verdict
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ",
+            )?;
+
+            for row in rows {
+                let affected = stmt.execute(rusqlite::params![
+                    row.0 as i64,
+                    row.1 as i64,
+                    row.2 as i64,
+                    row.3,
+                    row.4,
+                    row.5,
+                    row.6,
+                    row.7,
+                    row.8,
+                ])?;
+                inserted = inserted.saturating_add(affected);
+            }
+        }
+
+        tx.commit()?;
+        Ok(inserted)
     }
 
     /// Batch insert mempool transactions using a prepared statement and transaction.
@@ -349,14 +490,14 @@ impl Store {
 
     /// Retrieve simulated block values by ordering algorithm for a block.
     ///
-    /// Returns `(egp_simulated_total_value_wei, profit_simulated_total_value_wei)`.
+    /// Returns `(egp_simulated_total_value_wei, profit_simulated_total_value_wei, arbitrage_simulated_total_value_wei)`.
     ///
     /// # Errors
     /// Returns error if database query fails.
     pub fn get_simulated_values_for_block(
         &self,
         block_number: u64,
-    ) -> Result<(Option<u128>, Option<u128>)> {
+    ) -> Result<(Option<u128>, Option<u128>, Option<u128>)> {
         fn parse_wei(value: &str) -> u128 {
             if value.starts_with("0x") {
                 u128::from_str_radix(value.trim_start_matches("0x"), 16).unwrap_or(0)
@@ -377,6 +518,7 @@ impl Store {
         let mut rows = stmt.query(rusqlite::params![block_number])?;
         let mut egp_value: Option<u128> = None;
         let mut profit_value: Option<u128> = None;
+        let mut arbitrage_value: Option<u128> = None;
 
         while let Some(row) = rows.next()? {
             let algorithm: String = row.get(0)?;
@@ -390,11 +532,14 @@ impl Store {
                 "profit" => {
                     profit_value = Some(profit_value.unwrap_or(0).max(parsed));
                 }
+                "arbitrage" => {
+                    arbitrage_value = Some(arbitrage_value.unwrap_or(0).max(parsed));
+                }
                 _ => {}
             }
         }
 
-        Ok((egp_value, profit_value))
+        Ok((egp_value, profit_value, arbitrage_value))
     }
 
     /// Insert a simulation result row.
@@ -526,6 +671,8 @@ mod tests {
 
         assert!(tables.contains(&"block_transactions".to_string()));
         assert!(tables.contains(&"blocks".to_string()));
+        assert!(tables.contains(&"cex_prices".to_string()));
+        assert!(tables.contains(&"intra_block_arbs".to_string()));
         assert!(tables.contains(&"mempool_transactions".to_string()));
         assert!(tables.contains(&"mev_opportunities".to_string()));
         assert!(tables.contains(&"simulation_results".to_string()));

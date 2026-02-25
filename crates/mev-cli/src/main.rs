@@ -7,8 +7,12 @@ use indicatif::{ProgressBar, ProgressStyle};
 use mev_analysis::pnl::{compute_pnl, compute_range_stats, format_eth};
 use mev_data::blocks::BlockFetcher;
 use mev_data::mempool::download_and_store;
-use mev_data::store::Store;
+use mev_data::store::{IntraBlockArbRow, Store};
+use mev_sim::decoder::addresses;
 use mev_sim::ordering::{order_by_egp, order_by_profit};
+use mev_sim::strategies::arbitrage::{scan_for_arb, DEFAULT_ARB_PAIRS};
+use mev_sim::strategies::cex_dex_arb::{cex_price_f64_to_fp, scan_cex_dex, CexPricePoint};
+use mev_sim::strategies::dex_dex_intra::scan_default_dex_dex_intra_block;
 use mev_sim::EvmFork;
 use std::path::{Path, PathBuf};
 use tracing::{info, Level};
@@ -41,6 +45,7 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Commands {
     Fetch(FetchArgs),
+    IngestCex(IngestCexArgs),
     Simulate(SimulateArgs),
     Analyze(AnalyzeArgs),
     Status(StatusArgs),
@@ -68,6 +73,12 @@ struct SimulateArgs {
 
     #[arg(long, default_value = "egp")]
     algorithm: String,
+}
+
+#[derive(Args, Debug)]
+struct IngestCexArgs {
+    #[arg(long)]
+    csv: Vec<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -102,6 +113,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Fetch(args) => handle_fetch(&ctx, args).await,
+        Commands::IngestCex(args) => handle_ingest_cex(&ctx, args).await,
         Commands::Simulate(args) => handle_simulate(&ctx, args).await,
         Commands::Analyze(args) => handle_analyze(&ctx, args).await,
         Commands::Status(args) => handle_status(&ctx, args).await,
@@ -182,6 +194,68 @@ async fn handle_fetch(ctx: &AppContext, args: FetchArgs) -> Result<()> {
     Ok(())
 }
 
+async fn handle_ingest_cex(ctx: &AppContext, args: IngestCexArgs) -> Result<()> {
+    if args.csv.is_empty() {
+        return Err(eyre!("at least one --csv path is required"));
+    }
+
+    let store = Store::new(&ctx.db_path).wrap_err("failed to open SQLite store")?;
+    let mut rows = Vec::<(u64, f64, f64, f64, f64)>::new();
+
+    for path in &args.csv {
+        let content = std::fs::read_to_string(path)
+            .wrap_err_with(|| format!("failed to read {}", path.display()))?;
+
+        for (line_number, line) in content.lines().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            let parts: Vec<&str> = trimmed.split(',').collect();
+            if parts.len() < 6 {
+                tracing::debug!(
+                    file = %path.display(),
+                    line_number,
+                    "skipping malformed kline row"
+                );
+                continue;
+            }
+
+            let open_time_ms = match parts[0].parse::<u64>() {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+
+            let open = match parts[1].parse::<f64>() {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+            let high = match parts[2].parse::<f64>() {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+            let low = match parts[3].parse::<f64>() {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+            let close = match parts[4].parse::<f64>() {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+
+            rows.push((open_time_ms / 1000, open, close, high, low));
+        }
+    }
+
+    let inserted = store
+        .insert_cex_prices(&rows)
+        .wrap_err("failed to insert cex_prices rows")?;
+
+    info!(rows = rows.len(), inserted, "ingest-cex completed");
+    Ok(())
+}
+
 async fn handle_simulate(ctx: &AppContext, args: SimulateArgs) -> Result<()> {
     let store = Store::new(&ctx.db_path).wrap_err("failed to open SQLite store")?;
 
@@ -191,87 +265,236 @@ async fn handle_simulate(ctx: &AppContext, args: SimulateArgs) -> Result<()> {
         .wrap_err("failed to query block")?
         .ok_or_else(|| eyre!("block {} not found in database", args.block))?;
 
-    let block_txs = store
-        .get_block_txs(args.block)
-        .wrap_err("failed to query block transactions")?;
-
-    if block_txs.is_empty() {
-        info!(block_number = args.block, "no transactions in block");
-        return Ok(());
-    }
-
-    // Create EVM fork for simulation
-    let mut evm = EvmFork::at_block(args.block, &block).wrap_err("failed to create EVM fork")?;
-
     // Parse base fee
     let base_fee = parse_hex_u128(&block.base_fee_per_gas, "base_fee_per_gas")?;
-
-    // Get mempool transactions for this block
-    let mempool_txs = store
-        .get_mempool_txs_for_block(args.block)
-        .wrap_err("failed to query mempool transactions")?;
-
-    if mempool_txs.is_empty() {
-        info!(block_number = args.block, "no mempool transactions found");
-        return Ok(());
-    }
 
     // Run ordering algorithm(s)
     let mut results = Vec::new();
     let algorithms = if args.algorithm.to_lowercase() == "both" {
-        vec!["egp", "profit"]
+        vec!["egp", "profit", "arbitrage", "cex_dex", "dex_dex_intra"]
     } else {
         vec![args.algorithm.as_str()]
     };
 
+    let requires_mempool = algorithms
+        .iter()
+        .any(|algo| *algo == "egp" || *algo == "profit");
+    let mempool_txs = if requires_mempool {
+        let txs = store
+            .get_mempool_txs_for_block(args.block)
+            .wrap_err("failed to query mempool transactions")?;
+        if txs.is_empty() {
+            info!(
+                block_number = args.block,
+                "no mempool transactions found for mempool-dependent algorithm"
+            );
+            return Ok(());
+        }
+        txs
+    } else {
+        Vec::new()
+    };
+    const ARB_GAS_ESTIMATE_UNITS: u64 = 200_000;
+
     for algo in algorithms {
-        let (ordered_txs, rejected) = if algo == "egp" {
-            order_by_egp(mempool_txs.clone(), base_fee)
-        } else {
-            let ordered = order_by_profit(mempool_txs.clone(), &mut evm, base_fee)
-                .await
-                .wrap_err_with(|| format!("failed to order by {}", algo))?;
-            (ordered, 0)
+        let (ordered_txs, rejected, tx_count, total_gas, estimated_value) = match algo {
+            "egp" => {
+                let (ordered_txs, rejected) = order_by_egp(mempool_txs.clone(), base_fee);
+
+                let mut value_evm = EvmFork::at_block(args.block, &block)
+                    .wrap_err("failed to create EVM fork for value estimation")?;
+                let mut total_gas = 0_u64;
+                let mut estimated_value = 0_u128;
+                for tx in &ordered_txs {
+                    let sim = value_evm
+                        .simulate_tx(tx)
+                        .wrap_err_with(|| format!("failed to estimate ordered tx {}", tx.hash))?;
+                    if sim.success {
+                        total_gas = total_gas.saturating_add(sim.gas_used);
+                        estimated_value = estimated_value.saturating_add(sim.coinbase_payment);
+                    }
+                }
+
+                let tx_count = ordered_txs.len();
+                (ordered_txs, rejected, tx_count, total_gas, estimated_value)
+            }
+            "profit" => {
+                let mut profit_evm =
+                    EvmFork::at_block(args.block, &block).wrap_err("failed to create EVM fork")?;
+                let ordered_txs = order_by_profit(mempool_txs.clone(), &mut profit_evm, base_fee)
+                    .await
+                    .wrap_err_with(|| format!("failed to order by {}", algo))?;
+
+                let mut value_evm = EvmFork::at_block(args.block, &block)
+                    .wrap_err("failed to create EVM fork for value estimation")?;
+                let mut total_gas = 0_u64;
+                let mut estimated_value = 0_u128;
+                for tx in &ordered_txs {
+                    let sim = value_evm
+                        .simulate_tx(tx)
+                        .wrap_err_with(|| format!("failed to estimate ordered tx {}", tx.hash))?;
+                    if sim.success {
+                        total_gas = total_gas.saturating_add(sim.gas_used);
+                        estimated_value = estimated_value.saturating_add(sim.coinbase_payment);
+                    }
+                }
+
+                let tx_count = ordered_txs.len();
+                (ordered_txs, 0, tx_count, total_gas, estimated_value)
+            }
+            "arbitrage" => {
+                let rpc_url = ctx
+                    .rpc_url
+                    .as_deref()
+                    .ok_or_else(|| eyre!("MEV_RPC_URL is required for arbitrage strategy"))?;
+                let state_block = args.block.saturating_sub(1);
+                let opportunities =
+                    scan_for_arb(rpc_url, state_block, base_fee, &DEFAULT_ARB_PAIRS)
+                        .await
+                        .wrap_err("failed to scan arbitrage opportunities")?;
+
+                let weth_opportunity_count = opportunities
+                    .iter()
+                    .filter(|opp| opp.token_a == addresses::WETH)
+                    .count();
+                let estimated_value = opportunities
+                    .iter()
+                    .filter(|opp| opp.token_a == addresses::WETH)
+                    .map(|opp| opp.net_profit_wei)
+                    .sum::<u128>();
+                let total_gas =
+                    (weth_opportunity_count as u64).saturating_mul(ARB_GAS_ESTIMATE_UNITS);
+
+                (
+                    Vec::new(),
+                    0,
+                    weth_opportunity_count,
+                    total_gas,
+                    estimated_value,
+                )
+            }
+            "cex_dex" => {
+                let rpc_url = ctx
+                    .rpc_url
+                    .as_deref()
+                    .ok_or_else(|| eyre!("MEV_RPC_URL is required for cex_dex strategy"))?;
+                let cex_price_point =
+                    match store
+                        .get_nearest_cex_close_price_point(block.timestamp)
+                        .wrap_err("failed to query cex close price point")?
+                    {
+                        Some((timestamp_s, close)) => {
+                            let close_price_fp = cex_price_f64_to_fp(close)
+                                .wrap_err("failed to convert cex close to fixed-point")?;
+                            Some(CexPricePoint {
+                                timestamp_s,
+                                close_price_fp,
+                            })
+                        }
+                        None => None,
+                    };
+
+                let state_block = args.block.saturating_sub(1);
+                let maybe_opportunity = scan_cex_dex(
+                    rpc_url,
+                    state_block,
+                    block.timestamp,
+                    cex_price_point,
+                )
+                    .await
+                    .wrap_err("failed to scan cex_dex opportunity")?;
+
+                let tx_count = usize::from(maybe_opportunity.is_some());
+                let estimated_value = maybe_opportunity
+                    .as_ref()
+                    .map(|opportunity| opportunity.profit_wei)
+                    .unwrap_or(0);
+                let total_gas = (tx_count as u64).saturating_mul(ARB_GAS_ESTIMATE_UNITS);
+
+                (Vec::new(), 0, tx_count, total_gas, estimated_value)
+            }
+            "dex_dex_intra" => {
+                let rpc_url = ctx
+                    .rpc_url
+                    .as_deref()
+                    .ok_or_else(|| eyre!("MEV_RPC_URL is required for dex_dex_intra strategy"))?;
+
+                let opportunities =
+                    scan_default_dex_dex_intra_block(rpc_url, args.block, base_fee)
+                        .await
+                        .wrap_err("failed to scan intra-block dex_dex opportunities")?;
+
+                let rows: Vec<IntraBlockArbRow> = opportunities
+                    .iter()
+                    .map(|event| {
+                        (
+                            event.block_number,
+                            event.after_tx_index,
+                            event.after_log_index,
+                            format!("{:#x}", event.pool_a),
+                            format!("{:#x}", event.pool_b),
+                            event.spread_bps as i64,
+                            format!("0x{:x}", event.profit_wei),
+                            event.direction.clone(),
+                            event.verdict.clone(),
+                        )
+                    })
+                    .collect();
+                let _inserted = store
+                    .insert_intra_block_arbs(&rows)
+                    .wrap_err("failed to insert intra_block_arbs rows")?;
+
+                let tx_count = opportunities.len();
+                let estimated_value = opportunities
+                    .iter()
+                    .map(|event| event.profit_wei)
+                    .sum::<u128>();
+                let total_gas = (tx_count as u64).saturating_mul(ARB_GAS_ESTIMATE_UNITS);
+
+                (Vec::new(), 0, tx_count, total_gas, estimated_value)
+            }
+            _ => {
+                return Err(eyre!(
+                    "unknown algorithm '{}'; use 'egp', 'profit', 'arbitrage', 'cex_dex', 'dex_dex_intra', or 'both'",
+                    algo
+                ))
+            }
         };
 
-        let mut value_evm = EvmFork::at_block(args.block, &block)
-            .wrap_err("failed to create EVM fork for value estimation")?;
-        let mut total_gas = 0_u64;
-        let mut estimated_value = 0_u128;
-        for tx in &ordered_txs {
-            let sim = value_evm
-                .simulate_tx(tx)
-                .wrap_err_with(|| format!("failed to estimate ordered tx {}", tx.hash))?;
-            if sim.success {
-                total_gas = total_gas.saturating_add(sim.gas_used);
-                estimated_value = estimated_value.saturating_add(sim.coinbase_payment);
-            }
-        }
-
         // Persistence to SQLite
-        let algo_name = if algo == "egp" { "egp" } else { "profit" };
+        let algo_name = match algo {
+            "egp" => "egp",
+            "profit" => "profit",
+            "arbitrage" => "arbitrage",
+            "cex_dex" => "cex_dex",
+            "dex_dex_intra" => "dex_dex_intra",
+            _ => unreachable!(),
+        };
         store
             .insert_simulation_result(
                 args.block,
                 algo_name,
-                ordered_txs.len(),
+                tx_count,
                 total_gas,
                 &format!("0x{:x}", estimated_value),
                 "0x0",
             )
             .wrap_err("failed to insert simulation result")?;
 
-        results.push((algo_name, ordered_txs, rejected));
+        results.push((algo_name, ordered_txs, rejected, tx_count));
     }
 
     // Print tx-by-tx table for single block
-    for (algo_name, txs, rejected_count) in results {
+    for (algo_name, txs, rejected_count, selected_count) in results {
         println!(
             "\n=== {} Algorithm: {} ===",
             algo_name.to_uppercase(),
             args.block
         );
-        println!("Ordered: {}, Rejected: {}\n", txs.len(), rejected_count);
+        println!(
+            "Ordered: {}, Rejected: {}\n",
+            selected_count, rejected_count
+        );
 
         let mut table = Table::new();
         table.load_preset(UTF8_BORDERS_ONLY);
@@ -624,6 +847,7 @@ fn parse_hex_u128(value: &str, context: &str) -> Result<u128> {
             .wrap_err_with(|| format!("failed to parse hex value for {}: {}", context, value));
     }
 
-    u128::from_str_radix(trimmed, 10)
+    trimmed
+        .parse::<u128>()
         .wrap_err_with(|| format!("failed to parse decimal value for {}: {}", context, value))
 }

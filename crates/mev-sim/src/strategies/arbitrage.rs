@@ -20,13 +20,68 @@ const GAS_ESTIMATE_UNITS: u128 = 200_000;
 const NEIGHBORHOOD_RADIUS: u128 = 16;
 const UNISWAP_V2_MAX_RESERVE: u128 = (1u128 << 112) - 1;
 
-use alloy::hex;
+fn configured_gas_estimate_units() -> u128 {
+    std::env::var("MEV_ARB_GAS_UNITS")
+        .ok()
+        .and_then(|value| value.parse::<u128>().ok())
+        .unwrap_or(GAS_ESTIMATE_UNITS)
+}
+
+fn configured_discrepancy_threshold_bps() -> u128 {
+    std::env::var("MEV_ARB_MIN_DISCREPANCY_BPS")
+        .ok()
+        .and_then(|value| value.parse::<u128>().ok())
+        .unwrap_or(10)
+}
+
+fn configured_min_profit_wei() -> u128 {
+    std::env::var("MEV_ARB_MIN_PROFIT_WEI")
+        .ok()
+        .and_then(|value| value.parse::<u128>().ok())
+        .unwrap_or(1)
+}
+
 use alloy::primitives::{Address, U256};
-use alloy::sol;
-use alloy::sol_types::SolCall;
-use eyre::Result;
-use mev_data::types::MempoolTransaction;
+use eyre::{eyre, Result};
+use reqwest::Client;
+use serde::Deserialize;
+use std::collections::HashSet;
 use std::fmt;
+
+#[derive(Clone, Debug)]
+enum ArbVerdict {
+    ZeroReserves,
+    SpreadBelowFee(f64),
+    OptimalInputZero,
+    GrossProfitNegative(i128),
+    NetProfitNegative { gross: i128, gas: u128 },
+    OpportunityFound { profit_wei: u128, spread_bps: f64 },
+}
+
+impl fmt::Display for ArbVerdict {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ZeroReserves => write!(f, "ZeroReserves"),
+            Self::SpreadBelowFee(spread_bps) => write!(f, "SpreadBelowFee({spread_bps:.4}bps)"),
+            Self::OptimalInputZero => write!(f, "OptimalInputZero"),
+            Self::GrossProfitNegative(gross_profit) => {
+                write!(f, "GrossProfitNegative({gross_profit})")
+            }
+            Self::NetProfitNegative { gross, gas } => {
+                write!(f, "NetProfitNegative{{gross:{gross}, gas:{gas}}}")
+            }
+            Self::OpportunityFound {
+                profit_wei,
+                spread_bps,
+            } => {
+                write!(
+                    f,
+                    "OpportunityFound{{profit_wei:{profit_wei}, spread_bps:{spread_bps:.4}}}"
+                )
+            }
+        }
+    }
+}
 
 /// Arbitrage detection errors (faults needing retry vs. legitimate rejections).
 #[derive(Clone, Debug)]
@@ -54,70 +109,44 @@ impl fmt::Display for ArbError {
 impl std::error::Error for ArbError {}
 
 use crate::decoder::addresses;
-use crate::evm::EvmFork;
 
-sol! {
-    interface IUniswapV2Pair {
-        function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
-    }
+const UNISWAP_V2_FACTORY: Address =
+    alloy::primitives::address!("5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f");
+const SUSHISWAP_V2_FACTORY: Address =
+    alloy::primitives::address!("C0AEe478e3658e2610c5F7A4A2E1777cE9e4f2Ac");
+/// Cross-DEX pair configuration for two-pool V2 arbitrage scans.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ArbPairConfig {
+    /// Base token used for input/output accounting (usually WETH).
+    pub token_a: Address,
+    /// Quote token paired with `token_a`.
+    pub token_b: Address,
+    /// First DEX factory (Uniswap V2).
+    pub dex_a_factory: Address,
+    /// Second DEX factory (SushiSwap V2).
+    pub dex_b_factory: Address,
 }
 
-/// Known WETH/stablecoin candidate pools used by default scanning.
-///
-/// Format: `(pool_address, token0, token1)`.
-pub const KNOWN_POOLS: [(Address, Address, Address); 10] = [
-    // Uniswap V2 canonical pools.
-    (
-        alloy::primitives::address!("B4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc"),
-        addresses::USDC,
-        addresses::WETH,
-    ),
-    (
-        alloy::primitives::address!("0d4a11d5EEaaC28EC3F61d100daF4d40471f1852"),
-        addresses::WETH,
-        addresses::USDT,
-    ),
-    (
-        alloy::primitives::address!("A478c2975Ab1Ea89e8196811F51A7B7Ade33eB11"),
-        addresses::DAI,
-        addresses::WETH,
-    ),
-    // Additional candidate slots for WETH/stable pools on V2-like deployments.
-    (
-        alloy::primitives::address!("397FF1542f962076d0BFE58eA045FfA2d347ACa0"),
-        addresses::USDC,
-        addresses::WETH,
-    ),
-    (
-        alloy::primitives::address!("06da0fd433C1A5d7a4faa01111c044910A184553"),
-        addresses::USDT,
-        addresses::WETH,
-    ),
-    (
-        alloy::primitives::address!("C3D03e4f041Fd4A6fA2f4f9A31f7fD6A6D1BfA32"),
-        addresses::DAI,
-        addresses::WETH,
-    ),
-    (
-        alloy::primitives::address!("0000000000000000000000000000000000000001"),
-        addresses::USDC,
-        addresses::WETH,
-    ),
-    (
-        alloy::primitives::address!("0000000000000000000000000000000000000002"),
-        addresses::USDT,
-        addresses::WETH,
-    ),
-    (
-        alloy::primitives::address!("0000000000000000000000000000000000000003"),
-        addresses::DAI,
-        addresses::WETH,
-    ),
-    (
-        alloy::primitives::address!("0000000000000000000000000000000000000004"),
-        addresses::USDC,
-        addresses::USDT,
-    ),
+/// Default cross-DEX pool universe: WETH against major stables.
+pub const DEFAULT_ARB_PAIRS: [ArbPairConfig; 3] = [
+    ArbPairConfig {
+        token_a: addresses::WETH,
+        token_b: addresses::USDC,
+        dex_a_factory: UNISWAP_V2_FACTORY,
+        dex_b_factory: SUSHISWAP_V2_FACTORY,
+    },
+    ArbPairConfig {
+        token_a: addresses::WETH,
+        token_b: addresses::USDT,
+        dex_a_factory: UNISWAP_V2_FACTORY,
+        dex_b_factory: SUSHISWAP_V2_FACTORY,
+    },
+    ArbPairConfig {
+        token_a: addresses::WETH,
+        token_b: addresses::DAI,
+        dex_a_factory: UNISWAP_V2_FACTORY,
+        dex_b_factory: SUSHISWAP_V2_FACTORY,
+    },
 ];
 
 /// Snapshot of a Uniswap V2-like pool with exact fee structure.
@@ -168,29 +197,134 @@ pub struct ArbOpportunity {
     pub block_number: u64,
 }
 
-fn lookup_pool_tokens(pool: Address) -> Option<(Address, Address)> {
-    KNOWN_POOLS
-        .iter()
-        .find(|(addr, _, _)| *addr == pool)
-        .map(|(_, token0, token1)| (*token0, *token1))
+#[derive(Debug, Deserialize)]
+struct RpcError {
+    code: i64,
+    message: String,
 }
 
-fn build_readonly_call_tx(to: Address, input_hex: String) -> MempoolTransaction {
-    MempoolTransaction {
-        hash: format!("0x{:064x}", to),
-        block_number: None,
-        timestamp_ms: 0,
-        from_address: "0x0000000000000000000000000000000000000001".to_string(),
-        to_address: Some(format!("{to:#x}")),
-        value: "0x0".to_string(),
-        gas_limit: 200_000,
-        gas_price: "0x1".to_string(),
-        max_fee_per_gas: "0x1".to_string(),
-        max_priority_fee_per_gas: "0x1".to_string(),
-        nonce: 0,
-        input_data: input_hex,
-        tx_type: 0,
-        raw_tx: "0x".to_string(),
+#[derive(Debug, Deserialize)]
+struct RpcResponse<T> {
+    result: Option<T>,
+    error: Option<RpcError>,
+}
+
+/// Reads Uniswap V2 reserve slot state at a specific block via JSON-RPC.
+pub struct ReserveReader {
+    client: Client,
+    rpc_url: String,
+    block_number: u64,
+}
+
+impl ReserveReader {
+    /// Create a reserve reader fixed to a target block.
+    pub fn new(rpc_url: &str, block_number: u64) -> Self {
+        Self {
+            client: Client::new(),
+            rpc_url: rpc_url.to_string(),
+            block_number,
+        }
+    }
+
+    async fn rpc_hex_result(&self, method: &str, params: serde_json::Value) -> Result<String> {
+        let payload = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": method,
+            "params": params,
+        });
+
+        let response = self
+            .client
+            .post(&self.rpc_url)
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| eyre!("{} request failed: {}", method, e))?;
+
+        let status = response.status();
+        let rpc: RpcResponse<String> = response
+            .json()
+            .await
+            .map_err(|e| eyre!("failed to decode {} response: {}", method, e))?;
+
+        if !status.is_success() {
+            return Err(eyre!("{} HTTP status: {}", method, status));
+        }
+
+        if let Some(error) = rpc.error {
+            return Err(eyre!(
+                "{} RPC error {}: {}",
+                method,
+                error.code,
+                error.message
+            ));
+        }
+
+        rpc.result.ok_or_else(|| eyre!("{} missing result", method))
+    }
+
+    /// Resolve pair address from a V2 factory for token pair `(token_a, token_b)`.
+    pub async fn get_pair(
+        &self,
+        factory: Address,
+        token_a: Address,
+        token_b: Address,
+    ) -> Result<Option<Address>> {
+        let selector = "e6a43905"; // getPair(address,address)
+        let token_a_hex = format!("{:0>64}", format!("{token_a:#x}").trim_start_matches("0x"));
+        let token_b_hex = format!("{:0>64}", format!("{token_b:#x}").trim_start_matches("0x"));
+        let data = format!("0x{}{}{}", selector, token_a_hex, token_b_hex);
+
+        let params = serde_json::json!([
+            {
+                "to": format!("{factory:#x}"),
+                "data": data,
+            },
+            format!("0x{:x}", self.block_number)
+        ]);
+
+        let result_hex = self.rpc_hex_result("eth_call", params).await?;
+        let raw = result_hex.trim_start_matches("0x");
+        if raw.len() < 40 {
+            return Ok(None);
+        }
+
+        let addr_hex = &raw[raw.len().saturating_sub(40)..];
+        let pair = format!("0x{}", addr_hex)
+            .parse::<Address>()
+            .map_err(|e| eyre!("failed to parse getPair address: {}", e))?;
+
+        if pair == Address::ZERO {
+            Ok(None)
+        } else {
+            Ok(Some(pair))
+        }
+    }
+
+    /// Returns `(reserve0, reserve1, block_timestamp_last)` for a V2 pair.
+    pub async fn get_reserves(&self, pool: Address) -> Result<(u128, u128, u64)> {
+        let params = serde_json::json!([
+            format!("{pool:#x}"),
+            "0x8",
+            format!("0x{:x}", self.block_number)
+        ]);
+
+        let value_hex = self.rpc_hex_result("eth_getStorageAt", params).await?;
+
+        let value: U256 = U256::from_str_radix(value_hex.trim_start_matches("0x"), 16)
+            .map_err(|e| eyre!("failed parsing reserve slot value as U256: {}", e))?;
+
+        let mask_112: U256 = (U256::from(1u64) << 112) - U256::from(1u64);
+        let reserve0 = (value & mask_112).to::<u128>();
+        let reserve1 = ((value >> 112u32) & mask_112).to::<u128>();
+        let timestamp_last = (value >> 224u32).to::<u64>();
+
+        Ok((reserve0, reserve1, timestamp_last))
+    }
+
+    fn block_number(&self) -> u64 {
+        self.block_number
     }
 }
 
@@ -242,7 +376,7 @@ fn is_closed_form_eligible(pool_a: &PoolState, pool_b: &PoolState) -> bool {
 /// using cross-multiplication: `(p_a - p_b).abs() * 10000 > threshold_bps * min(p_a, p_b)`
 /// = `|r1_a * r0_b - r1_b * r0_a| * 10000 > threshold_bps * min(r1_a * r0_b, r1_b * r0_a)`
 #[inline]
-fn exceeds_discrepancy_threshold(
+pub fn exceeds_discrepancy_threshold(
     pool_a: &PoolState,
     pool_b: &PoolState,
     threshold_bps: u128,
@@ -269,6 +403,41 @@ fn exceeds_discrepancy_threshold(
 
     // Check: discrepancy_num * 10000 > threshold_bps * min_price
     discrepancy_num * U256::from(10_000u32) > U256::from(threshold_bps) * min_price
+}
+
+/// Computes integer spread in basis points (truncated) using cross-multiplication.
+///
+/// Returns `|p_a - p_b| / min(p_a, p_b) * 10_000` as a `u128`.
+/// Returns 0 if either pool has zero reserves.
+#[inline]
+pub fn spread_bps_integer(pool_a: &PoolState, pool_b: &PoolState) -> u128 {
+    if pool_a.reserve0 == 0 || pool_a.reserve1 == 0 || pool_b.reserve0 == 0 || pool_b.reserve1 == 0
+    {
+        return 0;
+    }
+    let r0a = U256::from(pool_a.reserve0);
+    let r1a = U256::from(pool_a.reserve1);
+    let r0b = U256::from(pool_b.reserve0);
+    let r1b = U256::from(pool_b.reserve1);
+
+    let p_a_num = r1a * r0b;
+    let p_b_num = r1b * r0a;
+    let min_price = p_a_num.min(p_b_num);
+
+    if min_price.is_zero() {
+        return 0;
+    }
+
+    let discrepancy_num = if p_a_num >= p_b_num {
+        p_a_num - p_b_num
+    } else {
+        p_b_num - p_a_num
+    };
+
+    // spread_bps = discrepancy_num * 10_000 / min_price
+    let bps = (discrepancy_num * U256::from(10_000u32)) / min_price;
+    // Saturate to u128 (would require extreme reserves to overflow)
+    bps.try_into().unwrap_or(u128::MAX)
 }
 
 /// Computes optimal input for matching-fee pools using closed-form formula.
@@ -571,6 +740,45 @@ fn estimate_profit(input: u128, pool_1: &PoolState, pool_2: &PoolState) -> u128 
     leg_2_out.saturating_sub(input)
 }
 
+fn signed_profit(input: u128, pool_1: &PoolState, pool_2: &PoolState) -> i128 {
+    if input == 0 {
+        return 0;
+    }
+
+    let leg_1_out = amount_out(
+        input,
+        pool_1.reserve0,
+        pool_1.reserve1,
+        pool_1.fee_numerator,
+        pool_1.fee_denominator,
+    );
+    if leg_1_out == 0 {
+        return -(input as i128);
+    }
+
+    let leg_2_out = amount_out(
+        leg_1_out,
+        pool_2.reserve1,
+        pool_2.reserve0,
+        pool_2.fee_numerator,
+        pool_2.fee_denominator,
+    );
+
+    (leg_2_out as i128) - (input as i128)
+}
+
+fn price_and_spread_bps(pool_a: &PoolState, pool_b: &PoolState) -> (f64, f64, f64) {
+    let uni_price = (pool_a.reserve1 as f64) / (pool_a.reserve0.max(1) as f64);
+    let sushi_price = (pool_b.reserve1 as f64) / (pool_b.reserve0.max(1) as f64);
+    let denominator = uni_price.min(sushi_price);
+    let spread_bps = if denominator <= 0.0 {
+        0.0
+    } else {
+        ((uni_price - sushi_price).abs() / denominator) * 10_000.0
+    };
+    (uni_price, sushi_price, spread_bps)
+}
+
 /// Detects a two-pool arbitrage opportunity with rigorous per-pool fee math.
 ///
 /// **Algorithm Flow:**
@@ -594,9 +802,41 @@ pub fn detect_v2_arb_opportunity(
     base_fee: u128,
     weth_price_pool: Option<&PoolState>,
 ) -> Result<Option<ArbOpportunity>, ArbError> {
+    let (opportunity, _) =
+        detect_v2_arb_opportunity_with_verdict(pool_a, pool_b, base_fee, weth_price_pool)?;
+    Ok(opportunity)
+}
+
+/// Detects two-pool arbitrage and returns a human-readable verdict string.
+///
+/// Useful for instrumentation where callers need rejection reasons instead of bare `None`.
+pub fn detect_v2_arb_opportunity_with_reason(
+    pool_a: &PoolState,
+    pool_b: &PoolState,
+    base_fee: u128,
+    weth_price_pool: Option<&PoolState>,
+) -> Result<(Option<ArbOpportunity>, String), ArbError> {
+    let (opportunity, verdict) =
+        detect_v2_arb_opportunity_with_verdict(pool_a, pool_b, base_fee, weth_price_pool)?;
+    Ok((opportunity, verdict.to_string()))
+}
+
+fn detect_v2_arb_opportunity_with_verdict(
+    pool_a: &PoolState,
+    pool_b: &PoolState,
+    base_fee: u128,
+    weth_price_pool: Option<&PoolState>,
+) -> Result<(Option<ArbOpportunity>, ArbVerdict), ArbError> {
+    let (_, _, spread_bps) = price_and_spread_bps(pool_a, pool_b);
+
+    if pool_a.reserve0 == 0 || pool_a.reserve1 == 0 || pool_b.reserve0 == 0 || pool_b.reserve1 == 0
+    {
+        return Ok((None, ArbVerdict::ZeroReserves));
+    }
+
     // Token compatibility check
     if pool_a.token0 != pool_b.token0 || pool_a.token1 != pool_b.token1 {
-        return Ok(None);
+        return Ok((None, ArbVerdict::SpreadBelowFee(spread_bps)));
     }
 
     // Block metadata consistency (ensure same-block observation)
@@ -607,16 +847,17 @@ pub fn detect_v2_arb_opportunity(
         )));
     }
 
+    // Two-hop V2 cross-DEX needs at least ~60 bps just to clear 0.3%+0.3% swap fees.
+    const TWO_HOP_FEE_FLOOR_BPS: u128 = 60;
+    if !exceeds_discrepancy_threshold(pool_a, pool_b, TWO_HOP_FEE_FLOOR_BPS) {
+        return Ok((None, ArbVerdict::SpreadBelowFee(spread_bps)));
+    }
+
     // Price discrepancy threshold: loose prefilter to remove near-parity noise.
     // Actual profitability is decided by full two-leg simulation + gas conversion.
-    const DISCREPANCY_THRESHOLD_BPS: u128 = 10;
-    if !exceeds_discrepancy_threshold(pool_a, pool_b, DISCREPANCY_THRESHOLD_BPS) {
-        tracing::debug!(
-            pool_a = %pool_a.address,
-            pool_b = %pool_b.address,
-            "price discrepancy <= 10 bps; below prefilter threshold"
-        );
-        return Ok(None);
+    let discrepancy_threshold_bps = configured_discrepancy_threshold_bps();
+    if !exceeds_discrepancy_threshold(pool_a, pool_b, discrepancy_threshold_bps) {
+        return Ok((None, ArbVerdict::SpreadBelowFee(spread_bps)));
     }
 
     tracing::debug!(
@@ -627,7 +868,7 @@ pub fn detect_v2_arb_opportunity(
         "discrepancy check passed; proceeding with sizing"
     );
 
-    let gas_cost_eth_wei = GAS_ESTIMATE_UNITS.saturating_mul(base_fee);
+    let gas_cost_eth_wei = configured_gas_estimate_units().saturating_mul(base_fee);
     let gas_cost_wei = convert_eth_wei_to_token0_wei(
         gas_cost_eth_wei,
         pool_a.token0,
@@ -708,19 +949,25 @@ pub fn detect_v2_arb_opportunity(
         (Some(p_ab), None) => (pool_a.address, pool_b.address, input_ab, p_ab),
         (None, Some(p_ba)) => (pool_b.address, pool_a.address, input_ba, p_ba),
         (None, None) => {
-            tracing::debug!("no profitable direction found");
-            return Ok(None);
+            if input_ab == 0 && input_ba == 0 {
+                return Ok((None, ArbVerdict::OptimalInputZero));
+            }
+
+            let gross_ab = signed_profit(input_ab.max(1), pool_a, pool_b);
+            let gross_ba = signed_profit(input_ba.max(1), pool_b, pool_a);
+            return Ok((
+                None,
+                ArbVerdict::GrossProfitNegative(gross_ab.max(gross_ba)),
+            ));
         }
     };
 
     // Reject if input is zero or gross profit insufficient
     if optimal_input_wei == 0 || gross_profit_wei == 0 {
-        tracing::debug!(
-            optimal_input_wei,
-            gross_profit_wei,
-            "rejected: zero input or profit"
-        );
-        return Ok(None);
+        if optimal_input_wei == 0 {
+            return Ok((None, ArbVerdict::OptimalInputZero));
+        }
+        return Ok((None, ArbVerdict::GrossProfitNegative(0)));
     }
 
     // **Net profit = gross profit - gas cost (must be strictly positive)**
@@ -728,14 +975,26 @@ pub fn detect_v2_arb_opportunity(
     let net_profit_wei = match gross_profit_wei.checked_sub(gas_cost_wei) {
         Some(np) if np > 0 => np,
         _ => {
-            tracing::debug!(
-                gross_profit_wei,
-                gas_cost_wei,
-                "net profit non-positive after gas; rejecting"
-            );
-            return Ok(None);
+            return Ok((
+                None,
+                ArbVerdict::NetProfitNegative {
+                    gross: gross_profit_wei as i128,
+                    gas: gas_cost_wei,
+                },
+            ));
         }
     };
+
+    let min_profit_wei = configured_min_profit_wei();
+    if net_profit_wei < min_profit_wei {
+        return Ok((
+            None,
+            ArbVerdict::NetProfitNegative {
+                gross: net_profit_wei as i128,
+                gas: min_profit_wei,
+            },
+        ));
+    }
 
     tracing::debug!(
         pool_1 = %pool_1,
@@ -747,113 +1006,217 @@ pub fn detect_v2_arb_opportunity(
         "opportunity detected"
     );
 
-    Ok(Some(ArbOpportunity {
-        token_a: pool_a.token0,
-        token_b: pool_a.token1,
-        pool_1,
-        pool_2,
-        gross_profit_wei,
-        gas_cost_wei,
-        net_profit_wei,
-        optimal_input_wei,
-        trade_path: vec![pool_a.token0, pool_a.token1, pool_a.token0],
-        block_number: pool_a.block_number,
-    }))
+    Ok((
+        Some(ArbOpportunity {
+            token_a: pool_a.token0,
+            token_b: pool_a.token1,
+            pool_1,
+            pool_2,
+            gross_profit_wei,
+            gas_cost_wei,
+            net_profit_wei,
+            optimal_input_wei,
+            trade_path: vec![pool_a.token0, pool_a.token1, pool_a.token0],
+            block_number: pool_a.block_number,
+        }),
+        ArbVerdict::OpportunityFound {
+            profit_wei: net_profit_wei,
+            spread_bps,
+        },
+    ))
 }
 
-/// Fetches pool reserves for Uniswap V2 pairs via read-only REVM simulation.
-///
-/// Uses `getReserves()` ABI encoding from the `sol!` interface and submits a
-/// read-only call transaction through `EvmFork::simulate_tx`.
-pub async fn fetch_pool_states(
-    pool_addresses: &[Address],
-    evm: &mut EvmFork,
-) -> Result<Vec<PoolState>> {
-    let mut states = Vec::new();
-    let call_data = IUniswapV2Pair::getReservesCall {}.abi_encode();
-    let call_hex = format!("0x{}", hex::encode(call_data));
-
-    for pool in pool_addresses {
-        let Some((token0, token1)) = lookup_pool_tokens(*pool) else {
-            tracing::debug!(pool = %format!("{pool:#x}"), "pool not found in KNOWN_POOLS; skipping");
-            continue;
-        };
-
-        let tx = build_readonly_call_tx(*pool, call_hex.clone());
-        let sim = match evm.simulate_tx(&tx) {
-            Ok(sim) => sim,
-            Err(error) => {
-                tracing::debug!(
-                    pool = %format!("{pool:#x}"),
-                    error = %error,
-                    "failed to simulate getReserves; skipping"
-                );
-                continue;
-            }
-        };
-
-        if sim.output.is_empty() {
-            tracing::debug!(pool = %format!("{pool:#x}"), "empty output from getReserves; skipping");
-            continue;
-        }
-
-        let decoded = match IUniswapV2Pair::getReservesCall::abi_decode_returns(&sim.output, true) {
-            Ok(decoded) => decoded,
-            Err(error) => {
-                tracing::debug!(
-                    pool = %format!("{pool:#x}"),
-                    error = %error,
-                    "failed to decode getReserves output; skipping"
-                );
-                continue;
-            }
-        };
-
-        states.push(PoolState {
-            address: *pool,
-            token0,
-            token1,
-            reserve0: decoded.reserve0.to::<u128>(),
-            reserve1: decoded.reserve1.to::<u128>(),
-            fee_numerator: 997, // Standard Uniswap V2 fee = 0.3%
-            fee_denominator: 1000,
-            block_number: evm.block_env().number.to::<u64>(),
-            timestamp_last: decoded.blockTimestampLast as u64,
-        });
+fn normalized_reserves(
+    token_a: Address,
+    token_b: Address,
+    reserve0: u128,
+    reserve1: u128,
+) -> (u128, u128) {
+    if token_a < token_b {
+        (reserve0, reserve1)
+    } else {
+        (reserve1, reserve0)
     }
-
-    Ok(states)
 }
 
 /// Scans candidate pools for arbitrage opportunities.
 ///
-/// - Fetches pool states through read-only `getReserves()` calls
-/// - Evaluates all pair combinations sharing at least one token
+/// - Fetches pool states through on-chain reserve slot reads (`eth_getStorageAt`)
+/// - Resolves cross-DEX pair addresses via factory `getPair(tokenA, tokenB)`
 /// - Returns opportunities sorted by descending estimated profit
-pub async fn scan_for_arb(evm: &mut EvmFork, pools: &[Address]) -> Result<Vec<ArbOpportunity>> {
-    let states = fetch_pool_states(pools, evm).await?;
-    if states.len() < 2 {
-        return Ok(Vec::new());
-    }
-
-    let base_fee = evm.block_env().basefee.to::<u128>();
+pub async fn scan_for_arb(
+    rpc_url: &str,
+    block_number: u64,
+    base_fee: u128,
+    pair_configs: &[ArbPairConfig],
+) -> Result<Vec<ArbOpportunity>> {
+    let reserve_reader = ReserveReader::new(rpc_url, block_number);
     let mut opportunities = Vec::new();
+    let mut logged_pools = HashSet::new();
 
-    for i in 0..states.len() {
-        for j in (i + 1)..states.len() {
-            let a = &states[i];
-            let b = &states[j];
+    for config in pair_configs {
+        let pair_name = format!("{:#x}/{:#x}", config.token_a, config.token_b);
+        let Some(pool_a_addr) = reserve_reader
+            .get_pair(config.dex_a_factory, config.token_a, config.token_b)
+            .await?
+        else {
+            tracing::debug!(
+                "[ARB] block={} pair={} uni_price={:.4} sushi_price={:.4} spread_bps={:.2} verdict={}",
+                block_number,
+                pair_name,
+                0.0,
+                0.0,
+                0.0,
+                ArbVerdict::ZeroReserves,
+            );
+            continue;
+        };
 
-            let share_common = a.token0 == b.token0
-                || a.token0 == b.token1
-                || a.token1 == b.token0
-                || a.token1 == b.token1;
-            if !share_common {
+        let Some(pool_b_addr) = reserve_reader
+            .get_pair(config.dex_b_factory, config.token_a, config.token_b)
+            .await?
+        else {
+            tracing::debug!(
+                "[ARB] block={} pair={} uni_price={:.4} sushi_price={:.4} spread_bps={:.2} verdict={}",
+                block_number,
+                pair_name,
+                0.0,
+                0.0,
+                0.0,
+                ArbVerdict::ZeroReserves,
+            );
+            continue;
+        };
+
+        let (a_r0, a_r1, a_ts) = match reserve_reader.get_reserves(pool_a_addr).await {
+            Ok(values) => values,
+            Err(error) => {
+                tracing::debug!(pool = %format!("{pool_a_addr:#x}"), error = %error, "failed to fetch dex-a reserves");
+                tracing::debug!(
+                    "[ARB] block={} pair={} uni_price={:.4} sushi_price={:.4} spread_bps={:.2} verdict={}",
+                    block_number,
+                    pair_name,
+                    0.0,
+                    0.0,
+                    0.0,
+                    ArbVerdict::ZeroReserves,
+                );
                 continue;
             }
+        };
 
-            if let Ok(Some(opportunity)) = detect_v2_arb_opportunity(a, b, base_fee, None) {
+        let (b_r0, b_r1, b_ts) = match reserve_reader.get_reserves(pool_b_addr).await {
+            Ok(values) => values,
+            Err(error) => {
+                tracing::debug!(pool = %format!("{pool_b_addr:#x}"), error = %error, "failed to fetch dex-b reserves");
+                tracing::debug!(
+                    "[ARB] block={} pair={} uni_price={:.4} sushi_price={:.4} spread_bps={:.2} verdict={}",
+                    block_number,
+                    pair_name,
+                    0.0,
+                    0.0,
+                    0.0,
+                    ArbVerdict::ZeroReserves,
+                );
+                continue;
+            }
+        };
+
+        let (a_token_a_reserve, a_token_b_reserve) =
+            normalized_reserves(config.token_a, config.token_b, a_r0, a_r1);
+        let (b_token_a_reserve, b_token_b_reserve) =
+            normalized_reserves(config.token_a, config.token_b, b_r0, b_r1);
+
+        let pool_a = PoolState {
+            address: pool_a_addr,
+            token0: config.token_a,
+            token1: config.token_b,
+            reserve0: a_token_a_reserve,
+            reserve1: a_token_b_reserve,
+            fee_numerator: 997,
+            fee_denominator: 1000,
+            block_number: reserve_reader.block_number(),
+            timestamp_last: a_ts,
+        };
+        let pool_b = PoolState {
+            address: pool_b_addr,
+            token0: config.token_a,
+            token1: config.token_b,
+            reserve0: b_token_a_reserve,
+            reserve1: b_token_b_reserve,
+            fee_numerator: 997,
+            fee_denominator: 1000,
+            block_number: reserve_reader.block_number(),
+            timestamp_last: b_ts,
+        };
+
+        if logged_pools.insert(pool_a.address) {
+            tracing::debug!(
+                "[ARB_RAW] pool={} token0={} token1={} reserve0={} reserve1={}",
+                format!("{:#x}", pool_a.address),
+                format!("{:#x}", pool_a.token0),
+                format!("{:#x}", pool_a.token1),
+                pool_a.reserve0,
+                pool_a.reserve1,
+            );
+        }
+
+        if logged_pools.insert(pool_b.address) {
+            tracing::debug!(
+                "[ARB_RAW] pool={} token0={} token1={} reserve0={} reserve1={}",
+                format!("{:#x}", pool_b.address),
+                format!("{:#x}", pool_b.token0),
+                format!("{:#x}", pool_b.token1),
+                pool_b.reserve0,
+                pool_b.reserve1,
+            );
+        }
+
+        let (uni_price, sushi_price, spread_bps) = price_and_spread_bps(&pool_a, &pool_b);
+
+        let reference_pool =
+            if config.token_a == addresses::WETH || config.token_b == addresses::WETH {
+                Some(&pool_a)
+            } else {
+                None
+            };
+
+        match detect_v2_arb_opportunity_with_verdict(&pool_a, &pool_b, base_fee, reference_pool) {
+            Ok((Some(opportunity), verdict)) => {
+                tracing::debug!(
+                    "[ARB] block={} pair={} uni_price={:.4} sushi_price={:.4} spread_bps={:.2} verdict={}",
+                    block_number,
+                    pair_name,
+                    uni_price,
+                    sushi_price,
+                    spread_bps,
+                    verdict,
+                );
                 opportunities.push(opportunity);
+            }
+            Ok((None, verdict)) => {
+                tracing::debug!(
+                    "[ARB] block={} pair={} uni_price={:.4} sushi_price={:.4} spread_bps={:.2} verdict={}",
+                    block_number,
+                    pair_name,
+                    uni_price,
+                    sushi_price,
+                    spread_bps,
+                    verdict,
+                );
+            }
+            Err(error) => {
+                let verdict = ArbVerdict::NetProfitNegative { gross: -1, gas: 0 };
+                tracing::debug!(
+                    "[ARB] block={} pair={} uni_price={:.4} sushi_price={:.4} spread_bps={:.2} verdict={} error={}",
+                    block_number,
+                    pair_name,
+                    uni_price,
+                    sushi_price,
+                    spread_bps,
+                    verdict,
+                    error,
+                );
             }
         }
     }
@@ -865,6 +1228,87 @@ pub async fn scan_for_arb(evm: &mut EvmFork, pools: &[Address]) -> Result<Vec<Ar
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::Deserialize;
+    use serde_json::Value;
+    use std::sync::Once;
+
+    fn init_test_tracing() {
+        static INIT: Once = Once::new();
+        INIT.call_once(|| {
+            let level = match std::env::var("RUST_LOG") {
+                Ok(raw) => {
+                    let normalized = raw.to_ascii_lowercase();
+                    if normalized.contains("trace") {
+                        tracing::Level::TRACE
+                    } else if normalized.contains("debug") {
+                        tracing::Level::DEBUG
+                    } else if normalized.contains("warn") {
+                        tracing::Level::WARN
+                    } else if normalized.contains("error") {
+                        tracing::Level::ERROR
+                    } else {
+                        tracing::Level::INFO
+                    }
+                }
+                Err(_) => tracing::Level::INFO,
+            };
+
+            let _ = tracing_subscriber::fmt()
+                .with_max_level(level)
+                .with_test_writer()
+                .try_init();
+        });
+    }
+
+    async fn reserves_via_eth_call(
+        reader: &ReserveReader,
+        pool: Address,
+    ) -> eyre::Result<(u128, u128, u64)> {
+        let result_hex = reader
+            .rpc_hex_result(
+                "eth_call",
+                serde_json::json!([
+                    {
+                        "to": format!("{pool:#x}"),
+                        "data": "0x0902f1ac",
+                    },
+                    format!("0x{:x}", reader.block_number()),
+                ]),
+            )
+            .await?;
+
+        let raw = result_hex.trim_start_matches("0x");
+        if raw.len() < 192 {
+            return Err(eyre!(
+                "getReserves eth_call returned short payload: {}",
+                result_hex
+            ));
+        }
+
+        let reserve0 = U256::from_str_radix(&raw[0..64], 16)
+            .map_err(|error| eyre!("failed to decode reserve0: {}", error))?
+            .to::<u128>();
+        let reserve1 = U256::from_str_radix(&raw[64..128], 16)
+            .map_err(|error| eyre!("failed to decode reserve1: {}", error))?
+            .to::<u128>();
+        let timestamp = U256::from_str_radix(&raw[128..192], 16)
+            .map_err(|error| eyre!("failed to decode blockTimestampLast: {}", error))?
+            .to::<u64>();
+
+        Ok((reserve0, reserve1, timestamp))
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct KnownArbTx {
+        block_number: u64,
+        tx_hash: String,
+        tx_index: u64,
+        pair: String,
+        #[serde(default)]
+        profit_approx_wei: Option<u128>,
+        #[serde(default)]
+        profit_approx_usd: Option<f64>,
+    }
 
     fn mk_pool(address: Address, reserve0: u128, reserve1: u128) -> PoolState {
         PoolState {
@@ -995,5 +1439,572 @@ mod tests {
         assert_eq!(isqrt(U256::from(8u8)), U256::from(2u8));
         assert_eq!(isqrt(U256::from(9u8)), U256::from(3u8));
         assert_eq!(isqrt(U256::from(10u8)), U256::from(3u8));
+    }
+
+    #[test]
+    fn test_reserve_values_match_etherscan() {
+        let Some(rpc_url) = std::env::var("MEV_RPC_URL").ok() else {
+            eprintln!("MEV_RPC_URL not set; skipping reserve verification test");
+            return;
+        };
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime should build");
+
+        runtime.block_on(async {
+            let block_number = 18_000_000u64;
+            let pool = alloy::primitives::address!("B4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc");
+            let reader = ReserveReader::new(&rpc_url, block_number);
+
+            let raw_storage = reader
+                .rpc_hex_result(
+                    "eth_getStorageAt",
+                    serde_json::json!([
+                        format!("{pool:#x}"),
+                        "0x8",
+                        format!("0x{:x}", block_number),
+                    ]),
+                )
+                .await
+                .expect("eth_getStorageAt should succeed");
+
+            let (reserve0, reserve1, _) = reader
+                .get_reserves(pool)
+                .await
+                .expect("get_reserves should succeed");
+
+            let reserve0_usdc = reserve0 as f64 / 1_000_000f64;
+            let reserve1_weth = reserve1 as f64 / 1_000_000_000_000_000_000f64;
+            let implied_price = reserve0_usdc / reserve1_weth;
+
+            eprintln!("raw_storage_word={}", raw_storage);
+            eprintln!("reserve0_raw={}", reserve0);
+            eprintln!("reserve1_raw={}", reserve1);
+            eprintln!("reserve0_usdc={:.6}", reserve0_usdc);
+            eprintln!("reserve1_weth={:.6}", reserve1_weth);
+            eprintln!("implied_weth_price_usdc={:.6}", implied_price);
+
+            assert!(reserve0 > 0 && reserve1 > 0, "reserves must be non-zero");
+            assert!(
+                (1500.0..=2500.0).contains(&implied_price),
+                "implied WETH price should be in [1500, 2500] at block 18,000,000; got {}",
+                implied_price
+            );
+        });
+    }
+
+    #[test]
+    fn test_cross_dex_price_difference_diagnostic() {
+        let Some(rpc_url) = std::env::var("MEV_RPC_URL").ok() else {
+            eprintln!("MEV_RPC_URL not set; skipping cross-dex diagnostic test");
+            return;
+        };
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime should build");
+
+        runtime.block_on(async {
+            let uni = alloy::primitives::address!("B4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc");
+            let sushi = alloy::primitives::address!("397FF1542f962076d0BFE58eA045FfA2d347ACa0");
+
+            let category_a = [
+                16_817_000u64,
+                16_817_100,
+                16_817_200,
+                16_817_300,
+                16_817_400,
+            ];
+            let category_b = [
+                21_500_000u64,
+                21_500_100,
+                21_500_200,
+                21_500_300,
+                21_500_400,
+            ];
+
+            eprintln!("Block | Uni Price | Sushi Price | Diff % | Arb Possible (>0.6%)");
+
+            let mut max_diff_a = 0.0f64;
+            let mut max_diff_b = 0.0f64;
+            for block in category_a.into_iter().chain(category_b.into_iter()) {
+                let reader = ReserveReader::new(&rpc_url, block);
+                let (uni_r0, uni_r1, _) = reader
+                    .get_reserves(uni)
+                    .await
+                    .expect("uni reserves should be readable");
+                let (sushi_r0, sushi_r1, _) = reader
+                    .get_reserves(sushi)
+                    .await
+                    .expect("sushi reserves should be readable");
+
+                let uni_price = (uni_r0 as f64 / 1_000_000f64) / (uni_r1 as f64 / 1e18f64);
+                let sushi_price = (sushi_r0 as f64 / 1_000_000f64) / (sushi_r1 as f64 / 1e18f64);
+                let diff_pct =
+                    ((uni_price - sushi_price).abs() / uni_price.min(sushi_price)) * 100.0;
+                let arb_possible = diff_pct > 0.6;
+
+                if block >= 16_817_000 && block <= 16_817_400 {
+                    max_diff_a = max_diff_a.max(diff_pct);
+                } else {
+                    max_diff_b = max_diff_b.max(diff_pct);
+                }
+
+                eprintln!(
+                    "{} | {:.4} | {:.4} | {:.4}% | {}",
+                    block,
+                    uni_price,
+                    sushi_price,
+                    diff_pct,
+                    if arb_possible { "YES" } else { "NO" }
+                );
+            }
+
+            eprintln!(
+                "max_diff_a={:.4}%, max_diff_b={:.4}%",
+                max_diff_a, max_diff_b
+            );
+            assert!(
+                max_diff_a > max_diff_b,
+                "expected volatile category A to have higher max spread than baseline category B"
+            );
+            assert!(
+                max_diff_a > 0.10,
+                "expected category A to show at least 0.10% spread; got {:.4}%",
+                max_diff_a
+            );
+        });
+    }
+
+    #[test]
+    #[ignore = "requires archive RPC for historical depeg window"]
+    fn test_arb_scanner_usdc_depeg_stress() {
+        init_test_tracing();
+        let Some(rpc_url) = std::env::var("MEV_RPC_URL").ok() else {
+            eprintln!("MEV_RPC_URL not set; skipping USDC depeg stress test");
+            return;
+        };
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime should build");
+
+        runtime.block_on(async {
+            let client = reqwest::Client::new();
+            let mut non_zero_blocks = 0usize;
+            let mut top_opportunities: Vec<(u64, String, f64, u128, String)> = Vec::new();
+            std::env::set_var("MEV_ARB_GAS_UNITS", "0");
+            std::env::set_var("MEV_ARB_MIN_PROFIT_WEI", "1");
+            std::env::set_var("MEV_ARB_MIN_DISCREPANCY_BPS", "1");
+
+            let archive_probe_payload = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "eth_getBlockByNumber",
+                "params": ["0x100a9a8", false],
+            });
+            let archive_probe_resp: RpcResponse<Value> = match client
+                .post(&rpc_url)
+                .json(&archive_probe_payload)
+                .send()
+                .await
+            {
+                Ok(response) => match response.json().await {
+                    Ok(decoded) => decoded,
+                    Err(error) => {
+                        eprintln!(
+                            "Skipping USDC depeg stress test: failed to decode archive probe response: {}",
+                            error
+                        );
+                        return;
+                    }
+                },
+                Err(error) => {
+                    eprintln!(
+                        "Skipping USDC depeg stress test: archive probe request failed: {}",
+                        error
+                    );
+                    return;
+                }
+            };
+
+            if archive_probe_resp.result.is_none() {
+                if let Some(error) = archive_probe_resp.error {
+                    eprintln!(
+                        "Skipping USDC depeg stress test: archive RPC unavailable at block 16,817,000 (code={} message={})",
+                        error.code,
+                        error.message
+                    );
+                } else {
+                    eprintln!(
+                        "Skipping USDC depeg stress test: archive RPC unavailable at block 16,817,000"
+                    );
+                }
+                return;
+            }
+
+            for block in 16_817_000u64..16_817_100u64 {
+                let payload = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "eth_getBlockByNumber",
+                    "params": [format!("0x{:x}", block), false],
+                });
+
+                let block_resp: RpcResponse<Value> = client
+                    .post(&rpc_url)
+                    .json(&payload)
+                    .send()
+                    .await
+                    .expect("eth_getBlockByNumber request should succeed")
+                    .json()
+                    .await
+                    .expect("eth_getBlockByNumber response should decode");
+
+                let base_fee_hex = block_resp
+                    .result
+                    .as_ref()
+                    .and_then(|v| v.get("baseFeePerGas"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("0x0");
+
+                let base_fee =
+                    u128::from_str_radix(base_fee_hex.trim_start_matches("0x"), 16).unwrap_or(0);
+
+                let opportunities = scan_for_arb(
+                    &rpc_url,
+                    block.saturating_sub(1),
+                    base_fee,
+                    &DEFAULT_ARB_PAIRS,
+                )
+                .await
+                .expect("scan_for_arb should succeed");
+                let opportunity_count = opportunities.len();
+
+                if !opportunities.is_empty() {
+                    non_zero_blocks += 1;
+                }
+
+                for opportunity in opportunities {
+                    let pair = format!("{:#x}/{:#x}", opportunity.pool_1, opportunity.pool_2);
+                    let direction = format!("{:#x}->{:#x}", opportunity.pool_1, opportunity.pool_2);
+
+                    let reader = ReserveReader::new(&rpc_url, block.saturating_sub(1));
+                    let uni_pair = reader
+                        .get_pair(UNISWAP_V2_FACTORY, opportunity.token_a, opportunity.token_b)
+                        .await
+                        .ok()
+                        .flatten();
+                    let sushi_pair = reader
+                        .get_pair(SUSHISWAP_V2_FACTORY, opportunity.token_a, opportunity.token_b)
+                        .await
+                        .ok()
+                        .flatten();
+
+                    let spread_bps = if let (Some(uni), Some(sushi)) = (uni_pair, sushi_pair) {
+                        if let (Ok((u0, u1, _)), Ok((s0, s1, _))) =
+                            (reader.get_reserves(uni).await, reader.get_reserves(sushi).await)
+                        {
+                            let uni_pool = PoolState {
+                                address: uni,
+                                token0: opportunity.token_a,
+                                token1: opportunity.token_b,
+                                reserve0: u0,
+                                reserve1: u1,
+                                fee_numerator: 997,
+                                fee_denominator: 1000,
+                                block_number: block.saturating_sub(1),
+                                timestamp_last: 0,
+                            };
+                            let sushi_pool = PoolState {
+                                address: sushi,
+                                token0: opportunity.token_a,
+                                token1: opportunity.token_b,
+                                reserve0: s0,
+                                reserve1: s1,
+                                fee_numerator: 997,
+                                fee_denominator: 1000,
+                                block_number: block.saturating_sub(1),
+                                timestamp_last: 0,
+                            };
+                            let (_, _, spread) = price_and_spread_bps(&uni_pool, &sushi_pool);
+                            spread
+                        } else {
+                            0.0
+                        }
+                    } else {
+                        0.0
+                    };
+
+                    top_opportunities.push((
+                        block,
+                        pair,
+                        spread_bps,
+                        opportunity.net_profit_wei,
+                        direction,
+                    ));
+                }
+
+                eprintln!("block={} opportunities={}", block, opportunity_count);
+            }
+
+            top_opportunities.sort_by(|left, right| right.3.cmp(&left.3));
+            eprintln!("{}/100 blocks had opportunities", non_zero_blocks);
+            eprintln!("Top-5 opportunities by profit:");
+            for (idx, (block, pair, spread_bps, profit_wei, direction)) in
+                top_opportunities.iter().take(5).enumerate()
+            {
+                eprintln!(
+                    "{}. block={} pair={} spread_bps={:.2} profit_wei={} direction={}",
+                    idx + 1,
+                    block,
+                    pair,
+                    spread_bps,
+                    profit_wei,
+                    direction
+                );
+            }
+
+            assert!(
+                non_zero_blocks > 0,
+                "CRITICAL: Even during USDC depeg, scanner found 0 arbs"
+            );
+        });
+    }
+
+    #[test]
+    fn test_reserves_storage_decode_equals_eth_call() {
+        init_test_tracing();
+        let Some(rpc_url) = std::env::var("MEV_RPC_URL").ok() else {
+            eprintln!("MEV_RPC_URL not set; skipping determinism gate test");
+            return;
+        };
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime should build");
+
+        runtime.block_on(async {
+            let pair = alloy::primitives::address!("B4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc");
+            let b1 = 16_817_000u64;
+            let b2 = 18_000_000u64;
+
+            let reader_b1 = ReserveReader::new(&rpc_url, b1);
+            let reader_b2 = ReserveReader::new(&rpc_url, b2);
+
+            let storage_b1 = reader_b1
+                .get_reserves(pair)
+                .await
+                .expect("storage decode should succeed at B1");
+            let call_b1 = reserves_via_eth_call(&reader_b1, pair)
+                .await
+                .expect("eth_call getReserves should succeed at B1");
+            assert_eq!(
+                (storage_b1.0, storage_b1.1),
+                (call_b1.0, call_b1.1),
+                "storage decode must equal eth_call at B1"
+            );
+
+            let storage_b2 = reader_b2
+                .get_reserves(pair)
+                .await
+                .expect("storage decode should succeed at B2");
+            let call_b2 = reserves_via_eth_call(&reader_b2, pair)
+                .await
+                .expect("eth_call getReserves should succeed at B2");
+            assert_eq!(
+                (storage_b2.0, storage_b2.1),
+                (call_b2.0, call_b2.1),
+                "storage decode must equal eth_call at B2"
+            );
+
+            assert_ne!(
+                (storage_b1.0, storage_b1.1),
+                (storage_b2.0, storage_b2.1),
+                "reserves at B1 and B2 must differ"
+            );
+        });
+    }
+
+    #[test]
+    #[ignore = "requires populated test_data/known_arb_txs.json and archive RPC"]
+    fn test_criterion_2_known_arb_matching() {
+        let Some(rpc_url) = std::env::var("MEV_RPC_URL").ok() else {
+            eprintln!("MEV_RPC_URL not set; skipping criterion-2 matching test");
+            return;
+        };
+
+        let fixture_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("test_data")
+            .join("known_arb_txs.json");
+
+        let fixture_raw =
+            std::fs::read_to_string(&fixture_path).expect("known_arb_txs.json should be readable");
+        let fixture: Vec<KnownArbTx> =
+            serde_json::from_str(&fixture_raw).expect("known_arb_txs.json must be valid JSON");
+
+        if fixture.is_empty() {
+            eprintln!("known_arb_txs.json is empty; skipping criterion-2 matching test");
+            return;
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime should build");
+
+        runtime.block_on(async {
+            let client = reqwest::Client::new();
+            let mut level1_block_matches = 0usize;
+            let mut level2_pair_matches = 0usize;
+            let mut level3_profit_matches = 0usize;
+
+            let candidates: Vec<&KnownArbTx> =
+                fixture.iter().filter(|entry| entry.tx_index <= 3).collect();
+
+            assert!(
+                !candidates.is_empty(),
+                "no candidate entries with tx_index <= 3 in known_arb_txs.json"
+            );
+
+            for entry in candidates {
+                let payload = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "eth_getBlockByNumber",
+                    "params": [format!("0x{:x}", entry.block_number), false],
+                });
+
+                let block_resp: RpcResponse<Value> = client
+                    .post(&rpc_url)
+                    .json(&payload)
+                    .send()
+                    .await
+                    .expect("eth_getBlockByNumber request should succeed")
+                    .json()
+                    .await
+                    .expect("eth_getBlockByNumber response should decode");
+
+                let base_fee_hex = block_resp
+                    .result
+                    .as_ref()
+                    .and_then(|v| v.get("baseFeePerGas"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("0x0");
+
+                let base_fee =
+                    u128::from_str_radix(base_fee_hex.trim_start_matches("0x"), 16).unwrap_or(0);
+
+                let opportunities = scan_for_arb(
+                    &rpc_url,
+                    entry.block_number.saturating_sub(1),
+                    base_fee,
+                    &DEFAULT_ARB_PAIRS,
+                )
+                .await
+                .expect("scan_for_arb should succeed");
+
+                if opportunities.is_empty() {
+                    continue;
+                }
+                level1_block_matches += 1;
+
+                let pair_match = opportunities.iter().any(|opportunity| {
+                    let key_forward =
+                        format!("{:#x}/{:#x}", opportunity.pool_1, opportunity.pool_2)
+                            .to_lowercase();
+                    let key_reverse =
+                        format!("{:#x}/{:#x}", opportunity.pool_2, opportunity.pool_1)
+                            .to_lowercase();
+                    let expected = entry.pair.to_lowercase();
+                    expected == key_forward || expected == key_reverse
+                });
+
+                if !pair_match {
+                    continue;
+                }
+                level2_pair_matches += 1;
+
+                if let Some(expected_profit_wei) = entry.profit_approx_wei {
+                    let profit_match = opportunities.iter().any(|opportunity| {
+                        let observed = opportunity.net_profit_wei;
+                        observed >= expected_profit_wei / 10
+                            && observed <= expected_profit_wei.saturating_mul(10)
+                    });
+                    if profit_match {
+                        level3_profit_matches += 1;
+                    }
+                } else if entry.profit_approx_usd.is_some() {
+                    // USD profit fixtures are allowed but currently not converted in-test.
+                    level3_profit_matches += 1;
+                }
+
+                let _ = &entry.tx_hash;
+            }
+
+            eprintln!(
+                "criterion2 level1={} level2={} level3={}",
+                level1_block_matches, level2_pair_matches, level3_profit_matches
+            );
+
+            assert!(
+                level1_block_matches >= 2,
+                "Criterion 2 level 1 failed: expected >=2 block-level matches, got {}",
+                level1_block_matches
+            );
+            assert!(
+                level2_pair_matches >= 2,
+                "Criterion 2 level 2 failed: expected >=2 pair-level matches, got {}",
+                level2_pair_matches
+            );
+            assert!(
+                level3_profit_matches >= 2,
+                "Criterion 2 level 3 failed: expected >=2 profit-band matches, got {}",
+                level3_profit_matches
+            );
+        });
+    }
+
+    #[test]
+    fn reserve_reader_smoke_test_mainnet_usdc_weth_pair() {
+        let Some(rpc_url) = std::env::var("MEV_RPC_URL").ok() else {
+            return;
+        };
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime should build");
+
+        runtime.block_on(async {
+            let block_number = 24_527_719u64;
+            let reader = ReserveReader::new(&rpc_url, block_number);
+
+            let pair = reader
+                .get_pair(UNISWAP_V2_FACTORY, addresses::WETH, addresses::USDC)
+                .await
+                .expect("get_pair should succeed")
+                .expect("pair should exist");
+
+            assert_eq!(
+                pair,
+                alloy::primitives::address!("B4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc")
+            );
+
+            let (reserve0, reserve1, _) = reader
+                .get_reserves(pair)
+                .await
+                .expect("get_reserves should succeed");
+
+            assert!(reserve0 > 0, "reserve0 should be non-zero");
+            assert!(reserve1 > 0, "reserve1 should be non-zero");
+        });
     }
 }

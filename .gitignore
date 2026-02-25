@@ -20,3 +20,15 @@ Cargo.lock
 data/*.db
 data/*.sqlite
 data/*.sqlite3
+
+# SQLite runtime files
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
+# Test data (generated)
+test_data/
+
+# Large data files (>50MB)
+data/cex/*.csv
+data/mempool/*.parquet

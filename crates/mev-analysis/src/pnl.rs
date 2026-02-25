@@ -30,6 +30,8 @@ pub struct BlockPnL {
     pub egp_simulated_value_wei: u128,
     /// Simulated value under profit ordering in Wei.
     pub profit_simulated_value_wei: u128,
+    /// Simulated value under arbitrage strategy in Wei.
+    pub arbitrage_simulated_value_wei: u128,
     /// Captured MEV in Wei.
     pub mev_captured_wei: u128,
     /// Private flow estimate in Wei.
@@ -53,6 +55,8 @@ pub struct RangeStats {
     pub total_egp_simulated_value_wei: u128,
     /// Sum of profit-sorted simulated values across range.
     pub total_profit_simulated_value_wei: u128,
+    /// Sum of arbitrage-strategy simulated values across range.
+    pub total_arbitrage_simulated_value_wei: u128,
     /// Sum of MEV captured across range.
     pub total_mev_captured_wei: u128,
     /// Sum of private flow estimates across range.
@@ -125,12 +129,15 @@ pub fn compute_pnl(block_number: u64, store: &Store) -> Result<BlockPnL> {
     let gas_used = txs.iter().map(|tx| tx.gas_used).sum::<u64>();
     let actual_block_value_wei = compute_actual_block_value(&block, &txs);
 
-    let (egp_simulated_opt, profit_simulated_opt) =
+    let (egp_simulated_opt, profit_simulated_opt, arbitrage_simulated_opt) =
         store.get_simulated_values_for_block(block_number)?;
     let egp_simulated_value_wei = egp_simulated_opt.unwrap_or(0);
     let profit_simulated_value_wei = profit_simulated_opt.unwrap_or(0);
+    let arbitrage_simulated_value_wei = arbitrage_simulated_opt.unwrap_or(0);
 
-    let simulated_block_value_wei = egp_simulated_value_wei.max(profit_simulated_value_wei);
+    let simulated_block_value_wei = egp_simulated_value_wei
+        .max(profit_simulated_value_wei)
+        .max(arbitrage_simulated_value_wei);
     let mev_captured_wei = simulated_block_value_wei.saturating_sub(actual_block_value_wei);
     let private_flow_estimate_wei =
         actual_block_value_wei.saturating_sub(simulated_block_value_wei);
@@ -152,6 +159,7 @@ pub fn compute_pnl(block_number: u64, store: &Store) -> Result<BlockPnL> {
         simulated_block_value_wei,
         egp_simulated_value_wei,
         profit_simulated_value_wei,
+        arbitrage_simulated_value_wei,
         mev_captured_wei,
         private_flow_estimate_wei,
         value_gap_wei,
@@ -179,6 +187,10 @@ pub fn compute_range_stats(records: &[BlockPnL]) -> RangeStats {
         .iter()
         .map(|record| record.profit_simulated_value_wei)
         .sum();
+    let total_arbitrage_simulated_value_wei = records
+        .iter()
+        .map(|record| record.arbitrage_simulated_value_wei)
+        .sum();
     let total_mev_captured_wei = records.iter().map(|record| record.mev_captured_wei).sum();
     let total_private_flow_estimate_wei = records
         .iter()
@@ -201,6 +213,7 @@ pub fn compute_range_stats(records: &[BlockPnL]) -> RangeStats {
         total_simulated_block_value_wei,
         total_egp_simulated_value_wei,
         total_profit_simulated_value_wei,
+        total_arbitrage_simulated_value_wei,
         total_mev_captured_wei,
         total_private_flow_estimate_wei,
         mean_capture_rate,
@@ -281,6 +294,7 @@ mod tests {
                 simulated_block_value_wei: 80,
                 egp_simulated_value_wei: 70,
                 profit_simulated_value_wei: 80,
+                arbitrage_simulated_value_wei: 0,
                 mev_captured_wei: 0,
                 private_flow_estimate_wei: 20,
                 value_gap_wei: -20,
@@ -297,6 +311,7 @@ mod tests {
                 simulated_block_value_wei: 300,
                 egp_simulated_value_wei: 250,
                 profit_simulated_value_wei: 300,
+                arbitrage_simulated_value_wei: 0,
                 mev_captured_wei: 100,
                 private_flow_estimate_wei: 0,
                 value_gap_wei: 100,
@@ -313,6 +328,7 @@ mod tests {
                 simulated_block_value_wei: 0,
                 egp_simulated_value_wei: 0,
                 profit_simulated_value_wei: 0,
+                arbitrage_simulated_value_wei: 0,
                 mev_captured_wei: 0,
                 private_flow_estimate_wei: 50,
                 value_gap_wei: -50,
@@ -326,6 +342,7 @@ mod tests {
         assert_eq!(stats.total_simulated_block_value_wei, 380);
         assert_eq!(stats.total_egp_simulated_value_wei, 320);
         assert_eq!(stats.total_profit_simulated_value_wei, 380);
+        assert_eq!(stats.total_arbitrage_simulated_value_wei, 0);
         assert_eq!(stats.total_private_flow_estimate_wei, 70);
         assert!((stats.mean_capture_rate - (0.8 + 1.5 + 0.0) / 3.0).abs() < 1e-12);
     }
