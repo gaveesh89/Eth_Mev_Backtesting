@@ -5,6 +5,8 @@ use comfy_table::presets::UTF8_BORDERS_ONLY;
 use comfy_table::Table;
 use indicatif::{ProgressBar, ProgressStyle};
 use mev_analysis::pnl::{compute_pnl, compute_range_stats, format_eth};
+use mev_analysis::scc_detector::detect_arbitrage;
+use mev_analysis::transfer_graph::{parse_transfer_log, TxTransferGraph};
 use mev_data::blocks::BlockFetcher;
 use mev_data::mempool::download_and_store;
 use mev_data::store::{IntraBlockArbRow, Store};
@@ -51,6 +53,8 @@ enum Commands {
     Status(StatusArgs),
     /// Diagnose swap activity in a block to assess scanner coverage.
     Diagnose(DiagnoseArgs),
+    /// Classify MEV in a block using SCC transfer-graph analysis.
+    Classify(ClassifyArgs),
 }
 
 #[derive(Args, Debug)]
@@ -112,6 +116,25 @@ struct DiagnoseArgs {
     block: u64,
 }
 
+/// Arguments for the `classify` subcommand.
+///
+/// Runs EigenPhi-style SCC analysis on stored tx receipt logs to detect
+/// protocol-agnostic arbitrage. Operates entirely from stored data.
+#[derive(Args, Debug)]
+struct ClassifyArgs {
+    /// Starting block number.
+    #[arg(long)]
+    start_block: u64,
+
+    /// Ending block number (inclusive).
+    #[arg(long)]
+    end_block: u64,
+
+    /// Output format: table (default) or json.
+    #[arg(long, default_value = "table")]
+    output: String,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     color_eyre::install()?;
@@ -131,6 +154,7 @@ async fn main() -> Result<()> {
         Commands::Analyze(args) => handle_analyze(&ctx, args).await,
         Commands::Status(args) => handle_status(&ctx, args).await,
         Commands::Diagnose(args) => handle_diagnose(&ctx, args).await,
+        Commands::Classify(args) => handle_classify(&ctx, args).await,
     }
 }
 
@@ -1092,6 +1116,230 @@ async fn handle_diagnose(ctx: &AppContext, args: DiagnoseArgs) -> Result<()> {
     );
 
     Ok(())
+}
+
+/// Classify MEV in a block range using SCC transfer-graph analysis.
+///
+/// For each block, reads stored Transfer event logs from the `tx_logs` table,
+/// builds a [`TxTransferGraph`] per transaction, and runs Tarjan's SCC algorithm
+/// to detect protocol-agnostic arbitrage. Results are printed as a table or JSON.
+///
+/// This implements the EigenPhi 6-step algorithm:
+/// 1. Parse Transfer events from stored logs
+/// 2. Build directed transfer graph per tx
+/// 3. Find strongly connected components
+/// 4. Locate profiteer (closest node to tx.from/tx.to)
+/// 5. Calculate net balance from SCC-internal edges
+/// 6. Positive net → arbitrage
+///
+/// # Errors
+/// Returns error if the database cannot be opened or block data is missing.
+async fn handle_classify(ctx: &AppContext, args: ClassifyArgs) -> Result<()> {
+    use alloy::primitives::Address;
+
+    if args.start_block > args.end_block {
+        return Err(eyre!(
+            "invalid range: start-block {} is greater than end-block {}",
+            args.start_block,
+            args.end_block
+        ));
+    }
+
+    let store = Store::new(&ctx.db_path).wrap_err("failed to open SQLite store")?;
+
+    let block_count = args.end_block - args.start_block + 1;
+    let pb = ProgressBar::new(block_count);
+    pb.set_style(
+        ProgressStyle::with_template("{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} blocks")
+            .wrap_err("failed to create progress style")?
+            .progress_chars("#>-"),
+    );
+
+    /// One detected arbitrage for output.
+    #[derive(Debug, serde::Serialize)]
+    struct ArbResult {
+        block_number: u64,
+        tx_hash: String,
+        profiteer: String,
+        scc_nodes: usize,
+        scc_edges: usize,
+        tokens_involved: usize,
+        profit_summary: String,
+    }
+
+    let mut all_results: Vec<ArbResult> = Vec::new();
+    let mut blocks_scanned: u64 = 0;
+    let mut txs_scanned: u64 = 0;
+
+    for block_num in args.start_block..=args.end_block {
+        // Get block transactions (needed for tx.from / tx.to)
+        let block_txs = store.get_block_txs(block_num).wrap_err_with(|| {
+            format!("failed to query block_transactions for block {block_num}")
+        })?;
+
+        if block_txs.is_empty() {
+            pb.inc(1);
+            continue;
+        }
+
+        // Get Transfer logs for this block
+        let transfer_logs = store
+            .get_transfer_logs_for_block(block_num)
+            .wrap_err_with(|| format!("failed to query transfer logs for block {block_num}"))?;
+
+        // Build a lookup: tx_hash → (from_address, to_address)
+        let tx_meta: std::collections::HashMap<String, (&str, &str)> = block_txs
+            .iter()
+            .map(|tx| {
+                (
+                    tx.tx_hash.clone(),
+                    (tx.from_address.as_str(), tx.to_address.as_str()),
+                )
+            })
+            .collect();
+
+        // Group transfer logs by tx_hash
+        let mut logs_by_tx: std::collections::HashMap<&str, Vec<&mev_data::TxLog>> =
+            std::collections::HashMap::new();
+        for log in &transfer_logs {
+            logs_by_tx
+                .entry(log.tx_hash.as_str())
+                .or_default()
+                .push(log);
+        }
+
+        // Process each transaction with transfer logs
+        for (tx_hash, logs) in &logs_by_tx {
+            txs_scanned += 1;
+
+            // Parse logs into TokenTransfers
+            let transfers: Vec<_> = logs
+                .iter()
+                .filter_map(|log| parse_transfer_log(log))
+                .collect();
+
+            if transfers.len() < 2 {
+                continue; // Need at least 2 transfers for a cycle
+            }
+
+            // Get tx.from and tx.to for this transaction
+            let (tx_from_str, tx_to_str) = match tx_meta.get(*tx_hash) {
+                Some(meta) => *meta,
+                None => continue,
+            };
+
+            let tx_from = tx_from_str.parse::<Address>().unwrap_or(Address::ZERO);
+            let tx_to = tx_to_str.parse::<Address>().unwrap_or(Address::ZERO);
+
+            // Build transfer graph
+            let graph = TxTransferGraph::from_transfers(&transfers, tx_from, tx_to);
+
+            // Run SCC detection
+            if let Some(detection) = detect_arbitrage(&graph) {
+                if detection.is_arbitrage {
+                    // Format profit summary
+                    let profit_summary: Vec<String> = detection
+                        .profit_tokens
+                        .iter()
+                        .map(|(token, amount)| format!("{token:#x}: {amount}"))
+                        .collect();
+
+                    all_results.push(ArbResult {
+                        block_number: block_num,
+                        tx_hash: tx_hash.to_string(),
+                        profiteer: format!("{:#x}", detection.profiteer),
+                        scc_nodes: detection.scc_node_count,
+                        scc_edges: detection.scc_edge_count,
+                        tokens_involved: detection.tokens_involved,
+                        profit_summary: profit_summary.join("; "),
+                    });
+                }
+            }
+        }
+
+        blocks_scanned += 1;
+        pb.inc(1);
+    }
+
+    pb.finish_and_clear();
+
+    // Output results
+    match args.output.as_str() {
+        "json" => {
+            let json = serde_json::to_string_pretty(&all_results)
+                .wrap_err("failed to serialize results to JSON")?;
+            println!("{json}");
+        }
+        _ => {
+            // Table output
+            let mut table = Table::new();
+            table.load_preset(UTF8_BORDERS_ONLY);
+            table.set_header(vec![
+                "Block",
+                "Tx Hash",
+                "Profiteer",
+                "SCC Nodes",
+                "SCC Edges",
+                "Tokens",
+                "Profit (token: raw amount)",
+            ]);
+
+            for result in &all_results {
+                table.add_row(vec![
+                    &format!("{}", result.block_number),
+                    &truncate_hash(&result.tx_hash),
+                    &truncate_hash(&result.profiteer),
+                    &format!("{}", result.scc_nodes),
+                    &format!("{}", result.scc_edges),
+                    &format!("{}", result.tokens_involved),
+                    &result.profit_summary,
+                ]);
+            }
+
+            println!("\n{table}\n");
+
+            // Summary
+            let mut summary = Table::new();
+            summary.load_preset(UTF8_BORDERS_ONLY);
+            summary.set_header(vec!["Metric", "Value"]);
+            summary.add_row(vec!["Blocks scanned", &format!("{blocks_scanned}")]);
+            summary.add_row(vec!["Transactions analyzed", &format!("{txs_scanned}")]);
+            summary.add_row(vec![
+                "Arbitrage txs detected",
+                &format!("{}", all_results.len()),
+            ]);
+
+            if !all_results.is_empty() {
+                let unique_profiteers: std::collections::HashSet<&str> =
+                    all_results.iter().map(|r| r.profiteer.as_str()).collect();
+                summary.add_row(vec![
+                    "Unique profiteers",
+                    &format!("{}", unique_profiteers.len()),
+                ]);
+            }
+
+            println!("{summary}\n");
+            println!("{}", mev_analysis::classify::ACCURACY_DISCLAIMER);
+        }
+    }
+
+    info!(
+        blocks_scanned,
+        txs_scanned,
+        arbs_detected = all_results.len(),
+        "classify command completed"
+    );
+
+    Ok(())
+}
+
+/// Truncate a hex hash/address for compact table display.
+fn truncate_hash(hash: &str) -> String {
+    if hash.len() > 14 {
+        format!("{}…{}", &hash[..8], &hash[hash.len() - 4..])
+    } else {
+        hash.to_string()
+    }
 }
 
 fn ensure_dir(path: &Path) -> Result<()> {
