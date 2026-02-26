@@ -8,6 +8,7 @@
 
 use std::collections::HashSet;
 
+use alloy::primitives::Address;
 use mev_data::types::BlockTransaction;
 use mev_sim::decoder::{DecodedTx, SwapDirection};
 
@@ -22,8 +23,12 @@ pub enum MevType {
     Sandwich,
     /// Backrun pattern.
     Backrun,
-    /// Arbitrage pattern.
+    /// Arbitrage pattern (reserve-based detection).
     Arbitrage,
+    /// Arbitrage detected via SCC transfer-graph analysis (protocol-agnostic).
+    ArbitrageScc,
+    /// Liquidation event.
+    Liquidation,
     /// Unknown / unclassified pattern.
     Unknown,
 }
@@ -69,16 +74,38 @@ fn tx_is_sell(decoded: &DecodedTx) -> bool {
     }
 }
 
+/// Extract a canonical pool key (sorted token pair) from a decoded swap.
+///
+/// For V2 swaps, uses the first two tokens in the path.
+/// Returns `None` for V3 swaps (encoded path) and unknown transactions.
+fn extract_pool_key(decoded: &DecodedTx) -> Option<(Address, Address)> {
+    let path = match decoded {
+        DecodedTx::V2Swap(data) => &data.path,
+        DecodedTx::V3Swap(_) | DecodedTx::Unknown => return None,
+    };
+    if path.len() < 2 {
+        return None;
+    }
+    let (a, b) = (path[0], path[1]);
+    if a < b {
+        Some((a, b))
+    } else {
+        Some((b, a))
+    }
+}
+
 /// Detect sandwich patterns using the spec heuristic.
 ///
 /// Conditions checked on each 3-transaction rolling window:
 /// 1. tx[0] and tx[2] same sender; tx[1] different sender
 /// 2. tx[0] buys token X, tx[1] swaps token X, tx[2] sells token X
 /// 3. tx[0] and tx[2] have higher effective gas price than tx[1]
+/// 4. All three transactions target the same liquidity pool (token pair)
 ///
 /// Confidence:
-/// - `0.9` if all three conditions are met
-/// - `0.6` if exactly two of three conditions are met
+/// - `0.95` if all four conditions are met
+/// - `0.8` if three conditions are met
+/// - `0.5` if two conditions are met
 pub fn detect_sandwich_pattern(
     txs: &[BlockTransaction],
     decoded: &[DecodedTx],
@@ -106,14 +133,21 @@ pub fn detect_sandwich_pattern(
         let gp2 = parse_u128_any(&t2.effective_gas_price);
         let cond_priority = gp0 > gp1 && gp2 > gp1;
 
-        let met_count = [cond_sender, cond_flow, cond_priority]
+        // Pool-match: all three txs target the same token pair (EigenPhi Step 2-3)
+        let pk0 = extract_pool_key(d0);
+        let pk1 = extract_pool_key(d1);
+        let pk2 = extract_pool_key(d2);
+        let cond_pool = pk0.is_some() && pk0 == pk1 && pk1 == pk2;
+
+        let met_count = [cond_sender, cond_flow, cond_priority, cond_pool]
             .iter()
             .filter(|flag| **flag)
             .count();
 
         let confidence = match met_count {
-            3 => 0.9,
-            2 => 0.6,
+            4 => 0.95,
+            3 => 0.8,
+            2 => 0.5,
             _ => continue,
         };
 
@@ -122,8 +156,8 @@ pub fn detect_sandwich_pattern(
             tx_hashes: vec![t0.tx_hash.clone(), t1.tx_hash.clone(), t2.tx_hash.clone()],
             confidence,
             rationale: format!(
-                "sandwich heuristic: sender={}, flow={}, priority={}",
-                cond_sender, cond_flow, cond_priority
+                "sandwich heuristic: sender={}, flow={}, priority={}, pool={}",
+                cond_sender, cond_flow, cond_priority, cond_pool
             ),
         });
     }
@@ -217,9 +251,53 @@ mod tests {
             }),
         ];
 
+        // 3/4 conditions met (pool key unavailable due to empty paths)
         let out = detect_sandwich_pattern(&txs, &decoded);
         assert_eq!(out.len(), 1);
-        assert!((out[0].confidence - 0.9).abs() < 1e-12);
+        assert!((out[0].confidence - 0.8).abs() < 1e-12);
+    }
+
+    #[test]
+    fn sandwich_with_pool_match_gives_highest_confidence() {
+        use mev_sim::decoder::addresses::{USDC, WETH};
+
+        let txs = vec![
+            mk_tx("0xa", "0xattacker", "0x64"),
+            mk_tx("0xb", "0xvictim", "0x32"),
+            mk_tx("0xc", "0xattacker", "0x64"),
+        ];
+
+        let decoded = vec![
+            DecodedTx::V2Swap(mev_sim::decoder::V2SwapData {
+                amount_in: U256::ZERO,
+                amount_out_min: U256::ZERO,
+                path: vec![WETH, USDC],
+                recipient: alloy::primitives::Address::ZERO,
+                deadline: 0,
+                direction: SwapDirection::EthToToken,
+            }),
+            DecodedTx::V2Swap(mev_sim::decoder::V2SwapData {
+                amount_in: U256::ZERO,
+                amount_out_min: U256::ZERO,
+                path: vec![WETH, USDC],
+                recipient: alloy::primitives::Address::ZERO,
+                deadline: 0,
+                direction: SwapDirection::EthToToken,
+            }),
+            DecodedTx::V2Swap(mev_sim::decoder::V2SwapData {
+                amount_in: U256::ZERO,
+                amount_out_min: U256::ZERO,
+                path: vec![USDC, WETH], // reversed path, same pool
+                recipient: alloy::primitives::Address::ZERO,
+                deadline: 0,
+                direction: SwapDirection::TokenToEth,
+            }),
+        ];
+
+        // 4/4 conditions met (pool key matches due to canonical ordering)
+        let out = detect_sandwich_pattern(&txs, &decoded);
+        assert_eq!(out.len(), 1);
+        assert!((out[0].confidence - 0.95).abs() < 1e-12);
     }
 
     #[test]

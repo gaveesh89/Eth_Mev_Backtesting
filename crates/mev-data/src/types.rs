@@ -78,3 +78,31 @@ pub struct BlockTransaction {
     /// Execution status (1=success, 0=revert).
     pub status: u32,
 }
+
+/// Transaction receipt log entry stored in SQLite.
+///
+/// Stores every event log emitted by transactions so that downstream
+/// crates can build transfer graphs and detect MEV via SCC analysis.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TxLog {
+    /// Block number containing this log.
+    pub block_number: u64,
+    /// Transaction hash that emitted this log (lowercase hex with 0x).
+    pub tx_hash: String,
+    /// Transaction index within the block.
+    pub tx_index: u64,
+    /// Log index within the block (global ordering).
+    pub log_index: u64,
+    /// Address of the contract that emitted the log (hex with 0x).
+    pub address: String,
+    /// Event signature topic (topic0, hex with 0x).
+    pub topic0: String,
+    /// First indexed parameter (hex with 0x), if present.
+    pub topic1: Option<String>,
+    /// Second indexed parameter (hex with 0x), if present.
+    pub topic2: Option<String>,
+    /// Third indexed parameter (hex with 0x), if present.
+    pub topic3: Option<String>,
+    /// Non-indexed log data (hex with 0x prefix).
+    pub data: String,
+}

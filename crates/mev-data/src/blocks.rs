@@ -15,7 +15,11 @@ use std::time::Duration;
 use tokio::sync::Semaphore;
 
 use crate::store::Store;
-use crate::types::{Block, BlockTransaction};
+use crate::types::{Block, BlockTransaction, TxLog};
+
+/// Data returned by [`BlockFetcher::fetch_block_with_txs`]: the block header,
+/// decoded transactions, and all receipt logs.
+type FetchedBlock = (Block, Vec<BlockTransaction>, Vec<TxLog>);
 
 /// Fetches full blocks with transactions from Ethereum RPC via Alloy provider.
 #[derive(Clone)]
@@ -64,17 +68,14 @@ impl BlockFetcher {
         })
     }
 
-    /// Fetches a full block with all transactions and receipts.
+    /// Fetches a full block with all transactions, receipts, and event logs.
     ///
     /// Returns `Ok(None)` if block does not exist.
     ///
     /// # Errors
     /// Returns error if RPC calls fail or required fields are missing.
     #[tracing::instrument(skip(self), fields(block_number))]
-    pub async fn fetch_block_with_txs(
-        &self,
-        block_number: u64,
-    ) -> Result<Option<(Block, Vec<BlockTransaction>)>> {
+    pub async fn fetch_block_with_txs(&self, block_number: u64) -> Result<Option<FetchedBlock>> {
         let block = self
             .retry("fetch block", || async {
                 let _permit = self
@@ -138,6 +139,9 @@ impl BlockFetcher {
         };
 
         let mut block_txs = Vec::with_capacity(tx_hashes.len());
+        let mut all_logs = Vec::new();
+        let mut global_log_index: u64 = 0;
+
         for (idx, tx_hash) in tx_hashes.iter().enumerate() {
             let receipt = receipt_map
                 .remove(tx_hash)
@@ -146,6 +150,27 @@ impl BlockFetcher {
             let status = if receipt.status() { 1 } else { 0 };
             let tx_index = receipt.transaction_index.unwrap_or(idx as u64);
             let effective_gas_price = receipt.effective_gas_price;
+
+            // Extract event logs from the receipt
+            for log in receipt.inner.logs() {
+                let topics = log.topics();
+                if topics.is_empty() {
+                    continue;
+                }
+                all_logs.push(TxLog {
+                    block_number,
+                    tx_hash: format!("{tx_hash:#x}"),
+                    tx_index,
+                    log_index: global_log_index,
+                    address: format!("{:#x}", log.address()),
+                    topic0: format!("{:#x}", topics[0]),
+                    topic1: topics.get(1).map(|t| format!("{t:#x}")),
+                    topic2: topics.get(2).map(|t| format!("{t:#x}")),
+                    topic3: topics.get(3).map(|t| format!("{t:#x}")),
+                    data: format!("{}", log.data().data),
+                });
+                global_log_index += 1;
+            }
 
             block_txs.push(BlockTransaction {
                 block_number,
@@ -162,7 +187,7 @@ impl BlockFetcher {
             });
         }
 
-        Ok(Some((block, block_txs)))
+        Ok(Some((block, block_txs, all_logs)))
     }
 
     /// Fetches a range of blocks with progress tracking.
@@ -209,10 +234,13 @@ impl BlockFetcher {
         for join_result in results {
             let (block_num, fetch_result) = join_result.wrap_err("task panicked")?;
             match fetch_result {
-                Ok(Some((block, txs))) => {
+                Ok(Some((block, txs, logs))) => {
                     store.insert_block(&block)?;
                     if !txs.is_empty() {
                         store.insert_block_txs(&txs)?;
+                    }
+                    if !logs.is_empty() {
+                        store.insert_tx_logs(&logs)?;
                     }
                 }
                 Ok(None) => {

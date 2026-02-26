@@ -11,7 +11,7 @@ use eyre::Result;
 use rusqlite::Connection;
 use std::cell::RefCell;
 
-use crate::types::{Block, BlockTransaction, MempoolTransaction};
+use crate::types::{Block, BlockTransaction, MempoolTransaction, TxLog};
 
 /// Row type for intra-block DEX-DEX arbitrage: `(block_number, after_tx_index, after_log_index, pool_a, pool_b, spread_bps, profit_wei, direction, verdict)`.
 pub type IntraBlockArbRow = (u64, u64, u64, String, String, i64, String, String, String);
@@ -123,9 +123,182 @@ impl Store {
                 verdict TEXT NOT NULL DEFAULT '',
                 PRIMARY KEY (block_number, after_log_index)
             );
+
+            CREATE TABLE IF NOT EXISTS tx_logs (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                block_number    INTEGER NOT NULL,
+                tx_hash         TEXT NOT NULL,
+                tx_index        INTEGER NOT NULL,
+                log_index       INTEGER NOT NULL,
+                address         TEXT NOT NULL,
+                topic0          TEXT NOT NULL,
+                topic1          TEXT,
+                topic2          TEXT,
+                topic3          TEXT,
+                data            TEXT NOT NULL DEFAULT '',
+                UNIQUE(tx_hash, log_index)
+            );
+            CREATE INDEX IF NOT EXISTS idx_tx_logs_block ON tx_logs(block_number);
+            CREATE INDEX IF NOT EXISTS idx_tx_logs_topic0 ON tx_logs(topic0);
+            CREATE INDEX IF NOT EXISTS idx_tx_logs_tx ON tx_logs(tx_hash);
             ",
         )?;
         Ok(())
+    }
+
+    /// Batch insert transaction receipt logs.
+    ///
+    /// Logs with duplicate `(tx_hash, log_index)` are ignored.
+    ///
+    /// # Errors
+    /// Returns error if database insert fails.
+    pub fn insert_tx_logs(&self, logs: &[TxLog]) -> Result<usize> {
+        let mut conn = self.conn.borrow_mut();
+        let tx = conn.transaction()?;
+        let mut inserted = 0usize;
+        {
+            let mut stmt = tx.prepare(
+                "
+                INSERT OR IGNORE INTO tx_logs (
+                    block_number, tx_hash, tx_index, log_index, address,
+                    topic0, topic1, topic2, topic3, data
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ",
+            )?;
+
+            for log in logs {
+                let affected = stmt.execute(rusqlite::params![
+                    log.block_number as i64,
+                    log.tx_hash,
+                    log.tx_index as i64,
+                    log.log_index as i64,
+                    log.address,
+                    log.topic0,
+                    log.topic1,
+                    log.topic2,
+                    log.topic3,
+                    log.data,
+                ])?;
+                inserted = inserted.saturating_add(affected);
+            }
+        }
+        tx.commit()?;
+        Ok(inserted)
+    }
+
+    /// Retrieve all logs for a given transaction hash.
+    ///
+    /// # Errors
+    /// Returns error if database query fails.
+    pub fn get_logs_for_tx(&self, tx_hash: &str) -> Result<Vec<TxLog>> {
+        let conn = self.conn.borrow();
+        let mut stmt = conn.prepare(
+            "
+            SELECT block_number, tx_hash, tx_index, log_index, address,
+                   topic0, topic1, topic2, topic3, data
+            FROM tx_logs
+            WHERE tx_hash = ?
+            ORDER BY log_index ASC
+            ",
+        )?;
+
+        let logs = stmt
+            .query_map(rusqlite::params![tx_hash], |row| {
+                Ok(TxLog {
+                    block_number: row.get::<_, i64>(0)? as u64,
+                    tx_hash: row.get(1)?,
+                    tx_index: row.get::<_, i64>(2)? as u64,
+                    log_index: row.get::<_, i64>(3)? as u64,
+                    address: row.get(4)?,
+                    topic0: row.get(5)?,
+                    topic1: row.get(6)?,
+                    topic2: row.get(7)?,
+                    topic3: row.get(8)?,
+                    data: row.get(9)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(logs)
+    }
+
+    /// Retrieve all logs for a given block number.
+    ///
+    /// # Errors
+    /// Returns error if database query fails.
+    pub fn get_logs_for_block(&self, block_number: u64) -> Result<Vec<TxLog>> {
+        let conn = self.conn.borrow();
+        let mut stmt = conn.prepare(
+            "
+            SELECT block_number, tx_hash, tx_index, log_index, address,
+                   topic0, topic1, topic2, topic3, data
+            FROM tx_logs
+            WHERE block_number = ?
+            ORDER BY log_index ASC
+            ",
+        )?;
+
+        let logs = stmt
+            .query_map(rusqlite::params![block_number as i64], |row| {
+                Ok(TxLog {
+                    block_number: row.get::<_, i64>(0)? as u64,
+                    tx_hash: row.get(1)?,
+                    tx_index: row.get::<_, i64>(2)? as u64,
+                    log_index: row.get::<_, i64>(3)? as u64,
+                    address: row.get(4)?,
+                    topic0: row.get(5)?,
+                    topic1: row.get(6)?,
+                    topic2: row.get(7)?,
+                    topic3: row.get(8)?,
+                    data: row.get(9)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(logs)
+    }
+
+    /// Retrieve only ERC-20 Transfer logs for a given block number.
+    ///
+    /// Filters to `topic0 = keccak256("Transfer(address,address,uint256)")`.
+    ///
+    /// # Errors
+    /// Returns error if database query fails.
+    pub fn get_transfer_logs_for_block(&self, block_number: u64) -> Result<Vec<TxLog>> {
+        const TRANSFER_TOPIC0: &str =
+            "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+        let conn = self.conn.borrow();
+        let mut stmt = conn.prepare(
+            "
+            SELECT block_number, tx_hash, tx_index, log_index, address,
+                   topic0, topic1, topic2, topic3, data
+            FROM tx_logs
+            WHERE block_number = ? AND topic0 = ?
+            ORDER BY log_index ASC
+            ",
+        )?;
+
+        let logs = stmt
+            .query_map(
+                rusqlite::params![block_number as i64, TRANSFER_TOPIC0],
+                |row| {
+                    Ok(TxLog {
+                        block_number: row.get::<_, i64>(0)? as u64,
+                        tx_hash: row.get(1)?,
+                        tx_index: row.get::<_, i64>(2)? as u64,
+                        log_index: row.get::<_, i64>(3)? as u64,
+                        address: row.get(4)?,
+                        topic0: row.get(5)?,
+                        topic1: row.get(6)?,
+                        topic2: row.get(7)?,
+                        topic3: row.get(8)?,
+                        data: row.get(9)?,
+                    })
+                },
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(logs)
     }
 
     /// Inserts Binance-derived CEX prices keyed by pair + second timestamp.
@@ -680,6 +853,7 @@ mod tests {
         assert!(tables.contains(&"mempool_transactions".to_string()));
         assert!(tables.contains(&"mev_opportunities".to_string()));
         assert!(tables.contains(&"simulation_results".to_string()));
+        assert!(tables.contains(&"tx_logs".to_string()));
     }
 
     #[test]
@@ -923,5 +1097,69 @@ mod tests {
             .block_range_exists(102, 100)
             .expect("query should succeed");
         assert!(!invalid);
+    }
+
+    #[test]
+    fn insert_and_retrieve_tx_logs() {
+        let store = Store::new(":memory:").expect("in-memory store should always open");
+
+        let logs = vec![
+            TxLog {
+                block_number: 100,
+                tx_hash: "0xaabbcc".to_string(),
+                tx_index: 0,
+                log_index: 0,
+                address: "0xtoken1".to_string(),
+                topic0: "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+                    .to_string(),
+                topic1: Some("0x000000000000000000000000from_addr".to_string()),
+                topic2: Some("0x0000000000000000000000000to__addr".to_string()),
+                topic3: None,
+                data: "0x0000000000000000000000000000000000000000000000000000000000000064"
+                    .to_string(),
+            },
+            TxLog {
+                block_number: 100,
+                tx_hash: "0xaabbcc".to_string(),
+                tx_index: 0,
+                log_index: 1,
+                address: "0xtoken2".to_string(),
+                topic0: "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822"
+                    .to_string(),
+                topic1: None,
+                topic2: None,
+                topic3: None,
+                data: "0x".to_string(),
+            },
+        ];
+
+        let count = store.insert_tx_logs(&logs).expect("insert should succeed");
+        assert_eq!(count, 2);
+
+        // Retrieve by tx hash
+        let by_tx = store
+            .get_logs_for_tx("0xaabbcc")
+            .expect("query should succeed");
+        assert_eq!(by_tx.len(), 2);
+        assert_eq!(by_tx[0].address, "0xtoken1");
+        assert_eq!(by_tx[1].address, "0xtoken2");
+
+        // Retrieve by block number
+        let by_block = store.get_logs_for_block(100).expect("query should succeed");
+        assert_eq!(by_block.len(), 2);
+
+        // Retrieve only Transfer logs
+        let transfers = store
+            .get_transfer_logs_for_block(100)
+            .expect("query should succeed");
+        assert_eq!(transfers.len(), 1);
+        assert_eq!(
+            transfers[0].topic0,
+            "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+        );
+
+        // Empty block returns empty vec
+        let empty = store.get_logs_for_block(999).expect("query should succeed");
+        assert!(empty.is_empty());
     }
 }

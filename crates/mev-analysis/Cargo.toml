@@ -25,3 +25,4 @@ comfy-table.workspace = true
 indicatif.workspace = true
 criterion.workspace = true
 dashmap.workspace = true
+petgraph.workspace = true
