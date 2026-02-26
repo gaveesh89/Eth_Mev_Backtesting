@@ -49,6 +49,8 @@ enum Commands {
     Simulate(SimulateArgs),
     Analyze(AnalyzeArgs),
     Status(StatusArgs),
+    /// Diagnose swap activity in a block to assess scanner coverage.
+    Diagnose(DiagnoseArgs),
 }
 
 #[derive(Args, Debug)]
@@ -99,6 +101,17 @@ struct StatusArgs {
     block: Option<u64>,
 }
 
+/// Arguments for the `diagnose` subcommand.
+///
+/// Counts V2/V3 Swap events per block, splits scanned vs unscanned pools,
+/// reads reserves + cross-DEX spreads, and checks CEX timestamp alignment.
+#[derive(Args, Debug)]
+struct DiagnoseArgs {
+    /// Target block number to diagnose.
+    #[arg(long)]
+    block: u64,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     color_eyre::install()?;
@@ -117,6 +130,7 @@ async fn main() -> Result<()> {
         Commands::Simulate(args) => handle_simulate(&ctx, args).await,
         Commands::Analyze(args) => handle_analyze(&ctx, args).await,
         Commands::Status(args) => handle_status(&ctx, args).await,
+        Commands::Diagnose(args) => handle_diagnose(&ctx, args).await,
     }
 }
 
@@ -826,6 +840,255 @@ async fn handle_status(ctx: &AppContext, _args: StatusArgs) -> Result<()> {
         simulations = sim_count,
         db_path = %ctx.db_path,
         "status command completed"
+    );
+
+    Ok(())
+}
+
+/// Diagnose swap activity in a single block.
+///
+/// Counts V2/V3 Swap events, splits by scanned vs unscanned pools,
+/// reads UniV2 reserves and cross-DEX spreads, and checks CEX timestamp
+/// alignment. This helps assess whether the scanner's pool universe explains
+/// a zero-opportunity result.
+///
+/// # Errors
+/// Returns error if RPC calls fail or DB cannot be opened.
+async fn handle_diagnose(ctx: &AppContext, args: DiagnoseArgs) -> Result<()> {
+    let rpc_url = ctx
+        .rpc_url
+        .as_deref()
+        .ok_or_else(|| eyre!("MEV_RPC_URL is required for diagnose command"))?;
+
+    let store = Store::new(&ctx.db_path).wrap_err("failed to open SQLite store")?;
+
+    let client = reqwest::Client::new();
+    let block_number = args.block;
+
+    // --- V2 Swap event topic ---
+    let v2_swap_topic = "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822";
+    let v3_swap_topic = "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67";
+
+    // Resolve scanned pool addresses from DEFAULT_ARB_PAIRS
+    let reserve_reader =
+        mev_sim::strategies::arbitrage::ReserveReader::new(rpc_url, block_number.saturating_sub(1));
+
+    let mut scanned_addrs: Vec<String> = Vec::new();
+    for pair in &DEFAULT_ARB_PAIRS {
+        if let Some(addr) = reserve_reader
+            .get_pair(pair.dex_a_factory, pair.token_a, pair.token_b)
+            .await?
+        {
+            scanned_addrs.push(format!("{addr:#x}"));
+        }
+        if let Some(addr) = reserve_reader
+            .get_pair(pair.dex_b_factory, pair.token_a, pair.token_b)
+            .await?
+        {
+            scanned_addrs.push(format!("{addr:#x}"));
+        }
+    }
+
+    let block_hex = format!("0x{block_number:x}");
+
+    // --- Count all V2 Swap events ---
+    let all_v2: Vec<serde_json::Value> = {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "eth_getLogs",
+            "params": [{"fromBlock": &block_hex, "toBlock": &block_hex, "topics": [v2_swap_topic]}]
+        });
+        let resp: serde_json::Value = client
+            .post(rpc_url)
+            .json(&body)
+            .send()
+            .await
+            .wrap_err("eth_getLogs V2 failed")?
+            .json()
+            .await?;
+        resp.get("result")
+            .and_then(|r| r.as_array())
+            .cloned()
+            .unwrap_or_default()
+    };
+
+    // --- Count all V3 Swap events ---
+    let all_v3: Vec<serde_json::Value> = {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": "eth_getLogs",
+            "params": [{"fromBlock": &block_hex, "toBlock": &block_hex, "topics": [v3_swap_topic]}]
+        });
+        let resp: serde_json::Value = client
+            .post(rpc_url)
+            .json(&body)
+            .send()
+            .await
+            .wrap_err("eth_getLogs V3 failed")?
+            .json()
+            .await?;
+        resp.get("result")
+            .and_then(|r| r.as_array())
+            .cloned()
+            .unwrap_or_default()
+    };
+
+    // Split V2 swaps by scanned/unscanned
+    let scanned_lower: Vec<String> = scanned_addrs.iter().map(|a| a.to_lowercase()).collect();
+    let v2_on_scanned = all_v2
+        .iter()
+        .filter(|log| {
+            log.get("address")
+                .and_then(|a| a.as_str())
+                .map(|a| scanned_lower.contains(&a.to_lowercase()))
+                .unwrap_or(false)
+        })
+        .count();
+    let v2_on_unscanned = all_v2.len() - v2_on_scanned;
+
+    // Count unique unscanned pools
+    let mut unscanned_pools: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for log in &all_v2 {
+        if let Some(addr) = log.get("address").and_then(|a| a.as_str()) {
+            let addr_lower = addr.to_lowercase();
+            if !scanned_lower.contains(&addr_lower) {
+                *unscanned_pools.entry(addr_lower).or_default() += 1;
+            }
+        }
+    }
+
+    // --- Read reserves and compute spreads ---
+    let mut spread_rows: Vec<(String, f64, f64, f64)> = Vec::new();
+    for pair in &DEFAULT_ARB_PAIRS {
+        let pair_name = if pair.token_b == addresses::USDC {
+            "WETH/USDC"
+        } else if pair.token_b == addresses::USDT {
+            "WETH/USDT"
+        } else {
+            "WETH/DAI"
+        };
+
+        let a_addr = reserve_reader
+            .get_pair(pair.dex_a_factory, pair.token_a, pair.token_b)
+            .await?;
+        let b_addr = reserve_reader
+            .get_pair(pair.dex_b_factory, pair.token_a, pair.token_b)
+            .await?;
+
+        if let (Some(a), Some(b)) = (a_addr, b_addr) {
+            let (a_r0, a_r1, _) = reserve_reader.get_reserves(a).await.unwrap_or((0, 0, 0));
+            let (b_r0, b_r1, _) = reserve_reader.get_reserves(b).await.unwrap_or((0, 0, 0));
+
+            if a_r0 > 0 && a_r1 > 0 && b_r0 > 0 && b_r1 > 0 {
+                // price = r0/r1 (quote/base), but token ordering varies
+                let a_price = a_r0 as f64 / a_r1 as f64;
+                let b_price = b_r0 as f64 / b_r1 as f64;
+                let spread = (a_price - b_price).abs() / a_price.min(b_price) * 10000.0;
+                spread_rows.push((pair_name.to_string(), a_price, b_price, spread));
+            }
+        }
+    }
+
+    // --- CEX timestamp check ---
+    let block_ts = store
+        .get_block(block_number)
+        .ok()
+        .flatten()
+        .map(|b| b.timestamp);
+    let cex_delta = if let Some(ts) = block_ts {
+        store
+            .get_nearest_cex_close_price_micro("ETHUSDC", ts)
+            .ok()
+            .flatten()
+            .map(|(cex_ts, _price)| cex_ts.abs_diff(ts))
+    } else {
+        None
+    };
+
+    // --- Print results ---
+    let mut table = Table::new();
+    table.load_preset(UTF8_BORDERS_ONLY);
+    table.set_header(vec!["Metric", "Value"]);
+
+    table.add_row(vec!["Block", &format!("{block_number}")]);
+    table.add_row(vec!["Scanned pools", &format!("{}", scanned_addrs.len())]);
+    table.add_row(vec!["V2 Swap events (total)", &format!("{}", all_v2.len())]);
+    table.add_row(vec!["  on scanned pools", &format!("{v2_on_scanned}")]);
+    table.add_row(vec!["  on unscanned pools", &format!("{v2_on_unscanned}")]);
+    table.add_row(vec!["V3 Swap events (total)", &format!("{}", all_v3.len())]);
+    table.add_row(vec![
+        "Unscanned V2 pool count",
+        &format!("{}", unscanned_pools.len()),
+    ]);
+
+    // Coverage percentage
+    let total_swaps = all_v2.len() + all_v3.len();
+    let coverage_pct = if total_swaps > 0 {
+        v2_on_scanned as f64 / total_swaps as f64 * 100.0
+    } else {
+        0.0
+    };
+    table.add_row(vec![
+        "Scanner coverage",
+        &format!("{coverage_pct:.1}% of swap events"),
+    ]);
+
+    println!("\n{table}\n");
+
+    // Cross-DEX spreads
+    if !spread_rows.is_empty() {
+        let mut spread_table = Table::new();
+        spread_table.load_preset(UTF8_BORDERS_ONLY);
+        spread_table.set_header(vec![
+            "Pair",
+            "UniV2 Price",
+            "Sushi Price",
+            "Spread (bps)",
+            "vs 60 bps floor",
+        ]);
+        for (name, a_p, b_p, spread) in &spread_rows {
+            let verdict = if *spread > 60.0 {
+                "ABOVE — should detect"
+            } else if *spread > 10.0 {
+                "10-60 bps — not profitable"
+            } else {
+                "Below prefilter"
+            };
+            spread_table.add_row(vec![
+                name.as_str(),
+                &format!("{a_p:.8}"),
+                &format!("{b_p:.8}"),
+                &format!("{spread:.2}"),
+                verdict,
+            ]);
+        }
+        println!("{spread_table}\n");
+    }
+
+    // CEX alignment
+    if let Some(delta) = cex_delta {
+        let status = if delta <= 3 { "OK" } else { "STALE (>3s)" };
+        info!(cex_delta_s = delta, status, "CEX timestamp alignment");
+    } else {
+        tracing::warn!("No CEX data or block not in DB for timestamp alignment check");
+    }
+
+    // Top unscanned pools
+    if !unscanned_pools.is_empty() {
+        let mut sorted: Vec<_> = unscanned_pools.iter().collect();
+        sorted.sort_by(|a, b| b.1.cmp(a.1));
+        info!("Top unscanned V2 pools:");
+        for (addr, cnt) in sorted.iter().take(5) {
+            info!(pool = %addr, swaps = cnt, "unscanned pool");
+        }
+    }
+
+    info!(
+        block = block_number,
+        v2_total = all_v2.len(),
+        v2_scanned = v2_on_scanned,
+        v3_total = all_v3.len(),
+        coverage_pct = format!("{coverage_pct:.1}%"),
+        "diagnose command completed"
     );
 
     Ok(())

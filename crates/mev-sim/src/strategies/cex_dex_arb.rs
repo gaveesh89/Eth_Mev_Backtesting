@@ -2,6 +2,20 @@
 //!
 //! Uses historical Binance ETHUSDC prices as a centralized exchange reference and
 //! compares against Uniswap V2 USDC/WETH reserves at `block_number` state.
+//!
+//! ## Known Limitations
+//!
+//! - **V2 pools only:** Compares CEX price against UniV2 and SushiSwap V2
+//!   WETH/USDC reserves. Uniswap V3 WETH/USDC (which dominates price
+//!   discovery by block 17M+) is not checked.
+//! - **Single pair:** Only scans WETH/USDC. Real CEX-DEX arb bots cover
+//!   dozens of pairs (WETH/USDT, BTC/ETH, etc.).
+//! - **30 bps threshold:** In calm markets (block 17M, April 2023), CEX-DEX
+//!   spreads are typically 2–8 bps — well below the 30 bps on-chain fee.
+//!   During volatility events (USDC depeg at block ~16.8M), spreads widen
+//!   enough for detection.
+//! - **3-second staleness window:** CEX data must be within 3 seconds of
+//!   block timestamp. Ensure 1-second kline coverage for the target range.
 
 use alloy::primitives::{Address, U256};
 use eyre::{eyre, Result};

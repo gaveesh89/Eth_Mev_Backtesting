@@ -16,6 +16,18 @@
 //! - `MEV_INTRA_DEBUG=1`: per-block summary (sync counts, max spread, candidate count)
 //! - `MEV_INTRA_DUMP_BLOCK=<N>`: dumps first ~30 timeline steps with human-readable
 //!   prices, reserve states, and verdict reasons for block `N`
+//!
+//! ## Known Limitations
+//!
+//! - **V2 `Sync` events only:** Tracks reserve state changes via the UniV2 `Sync`
+//!   log topic. Uniswap V3 `Swap` events (different signature and price model)
+//!   are not tracked, making the scanner blind to V3 intra-block price movements.
+//! - **Same 6-pool default set:** Uses [`DEFAULT_ARB_PAIRS`] plus 3 stable-stable
+//!   pairs = 12 pools. At block 17M, these pools see 0–1 Sync events per block
+//!   while ~17 V2 Swap events occur on unscanned long-tail pools.
+//! - **60 bps fee floor still applies:** Even within a block, two-hop V2 arbs
+//!   must overcome the 60 bps round-trip fee, which is rarely breached except
+//!   during extreme volatility (e.g., the USDC depeg at block ~16.8M).
 
 use std::collections::{HashMap, HashSet};
 

@@ -15,6 +15,28 @@
 //! - Overflow-safe U256 intermediates; no float arithmetic
 //! - Block metadata tracking (block_number, timestamp_last)
 //! - Typed error enum distinguishing faults from rejections
+//!
+//! ## Known Limitations
+//!
+//! - **V2-only pool universe:** Only scans Uniswap V2 and SushiSwap V2
+//!   constant-product pools. Uniswap V3, Curve, Balancer, and other AMM
+//!   protocols are not covered. By block 17M+ (April 2023), V3 handles
+//!   a significant share of DEX volume.
+//! - **3-pair default scan set:** [`DEFAULT_ARB_PAIRS`] covers only
+//!   WETH/{USDC,USDT,DAI} across 2 DEXes (6 pools total). Real MEV bots
+//!   scan thousands of pairs including long-tail tokens. Empirical testing
+//!   on block 17M shows 17 V2 Swap events per block, but zero on these
+//!   6 pools — all activity is on WETH/altcoin pairs.
+//! - **Pre-block state only:** Reads reserves at `block_number - 1`.
+//!   Post-MEV-Boost, builders extract cross-DEX arbs during block
+//!   construction, so pre-block spreads are already tight (<12 bps vs
+//!   the 60 bps two-hop fee floor).
+//! - **No multi-hop routing:** Only 2-pool (2-hop) routes. Real arb
+//!   often requires 3+ hops (e.g., WETH→TOKEN→USDC→WETH).
+//! - **Post-PBS baseline:** On post-MEV-Boost blocks (>15.5M), expect
+//!   zero profitable results on the default pair set. The scanner works
+//!   correctly — professional searchers simply extract opportunities
+//!   before block finalization.
 
 const GAS_ESTIMATE_UNITS: u128 = 200_000;
 const NEIGHBORHOOD_RADIUS: u128 = 16;
@@ -140,6 +162,10 @@ pub struct ArbPairConfig {
 }
 
 /// Default cross-DEX pool universe: WETH against major stables.
+///
+/// This covers 3 pairs × 2 DEXes = 6 pools. In practice, most on-chain MEV
+/// at block 17M+ happens on long-tail WETH/altcoin pairs not in this set.
+/// Extend via custom `ArbPairConfig` slices passed to [`scan_for_arb`].
 pub const DEFAULT_ARB_PAIRS: [ArbPairConfig; 3] = [
     ArbPairConfig {
         token_a: addresses::WETH,
