@@ -15,9 +15,9 @@ mod arbitrage_correctness {
     fn make_pool(address_str: &str, reserve0: u128, reserve1: u128, fee_bps: u32) -> PoolState {
         // Convert fee_bps to numerator/denominator (standard V2 = 997/1000)
         let (fee_numerator, fee_denominator) = match fee_bps {
-            30 => (997, 1000),                  // 0.3% fee (standard Uniswap V2)
-            25 => (9975, 10000),                // 0.25% fee (custom V2 fork example)
-            _ => (1000 - fee_bps as u32, 1000), // approximate conversion
+            30 => (997, 1000),           // 0.3% fee (standard Uniswap V2)
+            25 => (9975, 10000),         // 0.25% fee (custom V2 fork example)
+            _ => (1000 - fee_bps, 1000), // approximate conversion
         };
 
         PoolState {

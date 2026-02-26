@@ -1426,7 +1426,7 @@ mod tests {
         let opt_input_ba = optimal_input_closed_form(&pool_b, &pool_a);
 
         let opt_input = opt_input_ab
-            .or_else(|| opt_input_ba)
+            .or(opt_input_ba)
             .expect("closed-form should find optimal input");
         assert!(
             opt_input > 0,
@@ -1559,7 +1559,7 @@ mod tests {
                     ((uni_price - sushi_price).abs() / uni_price.min(sushi_price)) * 100.0;
                 let arb_possible = diff_pct > 0.6;
 
-                if block >= 16_817_000 && block <= 16_817_400 {
+                if (16_817_000..=16_817_400).contains(&block) {
                     max_diff_a = max_diff_a.max(diff_pct);
                 } else {
                     max_diff_b = max_diff_b.max(diff_pct);

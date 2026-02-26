@@ -30,3 +30,6 @@ jobs:
 
             - name: Test
               run: cargo test --workspace --all-targets
+
+            - name: Format
+              run: cargo fmt --all -- --check

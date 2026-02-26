@@ -1,44 +1,120 @@
 [
-    {
-        "block_number": 15537399,
-        "pair": "0xb4e16d0168e52d35cacd2c6185b44281ec28c9dc/0x397ff1542f962076d0bfe58ea045ffa2d347aca0",
-        "profit_approx_wei": 7944309540349416,
-        "tx_hash": "0x82ebef81f2dc5cf8b33a457b038db1bb043268364d83869ccee6f641070c154c",
-        "tx_index": 0
-    },
-    {
-        "block_number": 15537399,
-        "pair": "0xa478c2975ab1ea89e8196811f51a7b7ade33eb11/0xc3d03e4f041fd4cd388c549ee2a29a9e5075882f",
-        "profit_approx_wei": 2014056298931246,
-        "tx_hash": "0x82ebef81f2dc5cf8b33a457b038db1bb043268364d83869ccee6f641070c154c",
-        "tx_index": 0
-    },
-    {
-        "block_number": 15537400,
-        "pair": "0xb4e16d0168e52d35cacd2c6185b44281ec28c9dc/0x397ff1542f962076d0bfe58ea045ffa2d347aca0",
-        "profit_approx_wei": 7944309540349416,
-        "tx_hash": "0x23188a2f9812a3e607115fab031ca3b8e7d21ce1185a6b97585518d774bcd20f",
-        "tx_index": 0
-    },
-    {
-        "block_number": 15537400,
-        "pair": "0xa478c2975ab1ea89e8196811f51a7b7ade33eb11/0xc3d03e4f041fd4cd388c549ee2a29a9e5075882f",
-        "profit_approx_wei": 2013339237532217,
-        "tx_hash": "0x23188a2f9812a3e607115fab031ca3b8e7d21ce1185a6b97585518d774bcd20f",
-        "tx_index": 0
-    },
-    {
-        "block_number": 15537401,
-        "pair": "0xb4e16d0168e52d35cacd2c6185b44281ec28c9dc/0x397ff1542f962076d0bfe58ea045ffa2d347aca0",
-        "profit_approx_wei": 7944309540349416,
-        "tx_hash": "0x5b9f2133935b3cd640b28a9af2db8d950eb72f8a24012aa9622ee9a4ce3ed519",
-        "tx_index": 0
-    },
-    {
-        "block_number": 15537401,
-        "pair": "0xa478c2975ab1ea89e8196811f51a7b7ade33eb11/0xc3d03e4f041fd4cd388c549ee2a29a9e5075882f",
-        "profit_approx_wei": 2013339237532217,
-        "tx_hash": "0x5b9f2133935b3cd640b28a9af2db8d950eb72f8a24012aa9622ee9a4ce3ed519",
-        "tx_index": 0
-    }
+  {
+    "block_number": 15537405,
+    "tx_hash": "0xadc20e6f0eaed93b905f8775c4bcaa16d33dd4ce4f842384fa252768bc7e4713",
+    "tx_index": 0,
+    "pair": "0x0d4a11d5eeaac28ec3f61d100daf4d40471f1852/0x06da0fd433c1a5d7a4faa01111c044910a184553",
+    "profit_approx_wei": 0,
+    "verification_url": "https://etherscan.io/tx/0xadc20e6f0eaed93b905f8775c4bcaa16d33dd4ce4f842384fa252768bc7e4713#eventlog",
+    "verification_method": "etherscan_getLogs_block_swap_scan",
+    "verification_status": "CONFIRMED_CROSS_DEX_ARB",
+    "actual_arb_tx_hash": "0xadc20e6f0eaed93b905f8775c4bcaa16d33dd4ce4f842384fa252768bc7e4713",
+    "actual_arb_tx_count": 1,
+    "swap_details": [
+      "Sushi_WETH_USDT [token1->token0] a0in=0 a1in=15997805674 a0out=9966832767477638952 a1out=0",
+      "UniV2_WETH_USDT [token1->token0] a0in=0 a1in=35995062767 a0out=22418827461054014358 a1out=0",
+      "Sushi_WETH_USDC [token0->token1] a0in=16000000000 a1in=0 a0out=0 a1out=9957786989853297917"
+    ]
+  },
+  {
+    "block_number": 15537582,
+    "tx_hash": "0xd2e44814dac33d5f358e61f9acefdb697ceb907e88e515c3d3b97ac782402b84",
+    "tx_index": 0,
+    "pair": "0x0d4a11d5eeaac28ec3f61d100daf4d40471f1852/0x06da0fd433c1a5d7a4faa01111c044910a184553",
+    "profit_approx_wei": 0,
+    "verification_url": "https://etherscan.io/tx/0xd2e44814dac33d5f358e61f9acefdb697ceb907e88e515c3d3b97ac782402b84#eventlog",
+    "verification_method": "etherscan_getLogs_block_swap_scan",
+    "verification_status": "CONFIRMED_CROSS_DEX_ARB",
+    "actual_arb_tx_hash": "0xd2e44814dac33d5f358e61f9acefdb697ceb907e88e515c3d3b97ac782402b84",
+    "actual_arb_tx_count": 1,
+    "swap_details": [
+      "Sushi_WETH_USDT [token1->token0] a0in=0 a1in=19996965281 a0out=12133568880803231990 a1out=0",
+      "UniV2_WETH_USDT [token1->token0] a0in=0 a1in=23996358338 a0out=14556785710193292014 a1out=0",
+      "Sushi_WETH_USDC [token0->token1] a0in=20000000000 a1in=0 a0out=0 a1out=12147174947079973172"
+    ]
+  },
+  {
+    "block_number": 15537616,
+    "tx_hash": "0x3828c823249e1413b0f82340a307a92bf64a17ae97f4103556747101234fbfc4",
+    "tx_index": 0,
+    "pair": "0x0d4a11d5eeaac28ec3f61d100daf4d40471f1852/0x06da0fd433c1a5d7a4faa01111c044910a184553",
+    "profit_approx_wei": 0,
+    "verification_url": "https://etherscan.io/tx/0x3828c823249e1413b0f82340a307a92bf64a17ae97f4103556747101234fbfc4#eventlog",
+    "verification_method": "etherscan_getLogs_block_swap_scan",
+    "verification_status": "CONFIRMED_CROSS_DEX_ARB",
+    "actual_arb_tx_hash": "0x3828c823249e1413b0f82340a307a92bf64a17ae97f4103556747101234fbfc4",
+    "actual_arb_tx_count": 1,
+    "swap_details": [
+      "Sushi_WETH_USDT [token1->token0] a0in=0 a1in=10586658642 a0out=6434086368785073340 a1out=0",
+      "UniV2_WETH_USDT [token1->token0] a0in=0 a1in=19063115196 a0out=11588496744085041712 a1out=0"
+    ]
+  },
+  {
+    "block_number": 15537913,
+    "tx_hash": "0x9b08cae9e6baec3122083d2c25a9a38ccca6bc12fc626ce122ff602e8af23c74",
+    "tx_index": 0,
+    "pair": "0xb4e16d0168e52d35cacd2c6185b44281ec28c9dc/0x397ff1542f962076d0bfe58ea045ffa2d347aca0",
+    "profit_approx_wei": 0,
+    "verification_url": "https://etherscan.io/tx/0x9b08cae9e6baec3122083d2c25a9a38ccca6bc12fc626ce122ff602e8af23c74#eventlog",
+    "verification_method": "etherscan_getLogs_block_swap_scan",
+    "verification_status": "CONFIRMED_CROSS_DEX_ARB",
+    "actual_arb_tx_hash": "0x9b08cae9e6baec3122083d2c25a9a38ccca6bc12fc626ce122ff602e8af23c74",
+    "actual_arb_tx_count": 1,
+    "swap_details": [
+      "UniV2_WETH_USDC [token1->token0] a0in=0 a1in=7692307692307692539 a0out=12331996374 a1out=0",
+      "Sushi_WETH_USDC [token1->token0] a0in=0 a1in=7692307692307692539 a0out=12329249322 a1out=0"
+    ]
+  },
+  {
+    "block_number": 15538813,
+    "tx_hash": "0x03fd882ddb294a81f285bfc87ebfc47a02a2eb20d25813de666ffaed12f529e4",
+    "tx_index": 0,
+    "pair": "0xb4e16d0168e52d35cacd2c6185b44281ec28c9dc/0x397ff1542f962076d0bfe58ea045ffa2d347aca0",
+    "profit_approx_wei": 0,
+    "verification_url": "https://etherscan.io/tx/0x03fd882ddb294a81f285bfc87ebfc47a02a2eb20d25813de666ffaed12f529e4#eventlog",
+    "verification_method": "etherscan_getLogs_block_swap_scan",
+    "verification_status": "CONFIRMED_CROSS_DEX_ARB",
+    "actual_arb_tx_hash": "0x03fd882ddb294a81f285bfc87ebfc47a02a2eb20d25813de666ffaed12f529e4",
+    "actual_arb_tx_count": 1,
+    "swap_details": [
+      "UniV2_WETH_USDC [token0->token1] a0in=16996430411 a1in=0 a0out=0 a1out=10678101700968311954",
+      "Sushi_WETH_USDC [token0->token1] a0in=9997218024 a1in=0 a0out=0 a1out=6269904255581926608",
+      "UniV2_WETH_DAI [token0->token1] a0in=5997879922023000000000 a1in=0 a0out=0 a1out=3760716588418741343",
+      "Sushi_WETH_DAI [token0->token1] a0in=1000546425636000000000 a1in=0 a0out=0 a1out=627762608262153640"
+    ]
+  },
+  {
+    "block_number": 15538813,
+    "tx_hash": "0x03fd882ddb294a81f285bfc87ebfc47a02a2eb20d25813de666ffaed12f529e4",
+    "tx_index": 0,
+    "pair": "0xa478c2975ab1ea89e8196811f51a7b7ade33eb11/0xc3d03e4f041fd4cd388c549ee2a29a9e5075882f",
+    "profit_approx_wei": 0,
+    "verification_url": "https://etherscan.io/tx/0x03fd882ddb294a81f285bfc87ebfc47a02a2eb20d25813de666ffaed12f529e4#eventlog",
+    "verification_method": "etherscan_getLogs_block_swap_scan",
+    "verification_status": "CONFIRMED_CROSS_DEX_ARB",
+    "actual_arb_tx_hash": "0x03fd882ddb294a81f285bfc87ebfc47a02a2eb20d25813de666ffaed12f529e4",
+    "actual_arb_tx_count": 1,
+    "swap_details": [
+      "UniV2_WETH_USDC [token0->token1] a0in=16996430411 a1in=0 a0out=0 a1out=10678101700968311954",
+      "Sushi_WETH_USDC [token0->token1] a0in=9997218024 a1in=0 a0out=0 a1out=6269904255581926608",
+      "UniV2_WETH_DAI [token0->token1] a0in=5997879922023000000000 a1in=0 a0out=0 a1out=3760716588418741343",
+      "Sushi_WETH_DAI [token0->token1] a0in=1000546425636000000000 a1in=0 a0out=0 a1out=627762608262153640"
+    ]
+  },
+  {
+    "block_number": 15539280,
+    "tx_hash": "0xbcd7296c3a154a4e1f3c78b466435131c8b6219090d44dcb0cd2759bdeb09a71",
+    "tx_index": 0,
+    "pair": "0xb4e16d0168e52d35cacd2c6185b44281ec28c9dc/0x397ff1542f962076d0bfe58ea045ffa2d347aca0",
+    "profit_approx_wei": 0,
+    "verification_url": "https://etherscan.io/tx/0xbcd7296c3a154a4e1f3c78b466435131c8b6219090d44dcb0cd2759bdeb09a71#eventlog",
+    "verification_method": "etherscan_getLogs_block_swap_scan",
+    "verification_status": "CONFIRMED_CROSS_DEX_ARB",
+    "actual_arb_tx_hash": "0xbcd7296c3a154a4e1f3c78b466435131c8b6219090d44dcb0cd2759bdeb09a71",
+    "actual_arb_tx_count": 1,
+    "swap_details": [
+      "UniV2_WETH_USDC [token0->token1] a0in=263805731 a1in=0 a0out=0 a1out=165386424212170940",
+      "Sushi_WETH_USDC [token0->token1] a0in=338176521 a1in=0 a0out=0 a1out=211897944405325140"
+    ]
+  }
 ]

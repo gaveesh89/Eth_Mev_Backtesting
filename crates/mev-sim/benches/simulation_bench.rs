@@ -38,7 +38,10 @@ fn sample_pool(address_suffix: u8, reserve0: u128, reserve1: u128) -> PoolState 
         token1: address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
         reserve0,
         reserve1,
-        fee_bps: 30,
+        fee_numerator: 997,
+        fee_denominator: 1000,
+        block_number: 0,
+        timestamp_last: 0,
     }
 }
 
@@ -129,6 +132,7 @@ fn bench_arb_detection_10_pools(c: &mut Criterion) {
                             black_box(&pools[i]),
                             black_box(&pools[j]),
                             black_box(base_fee),
+                            None,
                         );
                     }
                 }

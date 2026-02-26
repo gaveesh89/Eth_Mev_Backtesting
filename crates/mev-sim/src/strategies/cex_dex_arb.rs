@@ -640,7 +640,7 @@ mod tests {
         let reserve_quote = 1_600_000_000u128 * 10u128.pow(6);
         let cex = CexPricePoint {
             timestamp_s: block_timestamp_s,
-            close_price_fp: 1_604_70000000,
+            close_price_fp: 160_470_000_000,
         };
 
         let verdict_a = evaluate_cex_dex_opportunity(
@@ -696,7 +696,7 @@ mod tests {
             reserve_weth,
             Some(CexPricePoint {
                 timestamp_s: block_timestamp_s.saturating_sub(99),
-                close_price_fp: 1_600_00000000,
+                close_price_fp: 160_000_000_000,
             }),
             addresses::USDC,
             30,

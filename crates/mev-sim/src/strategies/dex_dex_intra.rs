@@ -684,7 +684,7 @@ mod tests {
             .parse()
             .unwrap();
 
-        let mut snapshots = vec![
+        let mut snapshots = [
             ReserveSnapshot {
                 pool: pool_uni,
                 tx_index: 0,
