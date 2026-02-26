@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>MEV Backtest Dashboard</title>
+    <link rel="stylesheet" href="/Eth_Mev_Backtesting/style-e750b048055b8037.css" integrity="sha384-yWJaUhr0oTgd7zYROz5TOPG9qbWzgBqL5fuPmJohX5foB3Uy55oVih2HkKa3f8ga"/>
+    
+<script type="module">
+import init, * as bindings from '/Eth_Mev_Backtesting/mev-dashboard-40349916492db151.js';
+const wasm = await init({ module_or_path: '/Eth_Mev_Backtesting/mev-dashboard-40349916492db151_bg.wasm' });
+
+
+window.wasmBindings = bindings;
+
+
+dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
+
+</script>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+        href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap"
+        rel="stylesheet" />
+<link rel="modulepreload" href="/Eth_Mev_Backtesting/mev-dashboard-40349916492db151.js" crossorigin="anonymous" integrity="sha384-0R8/1w3BSDS6sVV+hTGL3eo0Fc6L4HxK2pais8pHkN5HPagDKC6tIHtR+QHbAXc9"><link rel="preload" href="/Eth_Mev_Backtesting/mev-dashboard-40349916492db151_bg.wasm" crossorigin="anonymous" integrity="sha384-AEpSJ6BM450O9vqx+Ev7UuF27Vc/sUDZ0mme00DS2/dQ5ydj1BrFFTIJp08n9LNH" as="fetch" type="application/wasm"></head>
+
+<body>
+    <!-- Yew renders into <body> -->
+</body>
+
+</html>
