@@ -28,6 +28,7 @@ data/*.sqlite3
 
 # Test data (generated)
 test_data/
+!test_data/known_arb_txs.json
 
 # Large data files (>50MB)
 data/cex/*.csv
