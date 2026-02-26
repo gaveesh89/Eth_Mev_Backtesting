@@ -8,16 +8,14 @@ on:
     workflow_dispatch:
 
 permissions:
-    contents: read
-    pages: write
-    id-token: write
+    contents: write
 
 concurrency:
     group: pages
     cancel-in-progress: true
 
 jobs:
-    build:
+    build-and-deploy:
         runs-on: ubuntu-latest
         steps:
             - uses: actions/checkout@v4
@@ -43,18 +41,12 @@ jobs:
               working-directory: crates/mev-dashboard
               run: trunk build --release --public-url /Eth_Mev_Backtesting/
 
-            - name: Upload Pages artifact
-              uses: actions/upload-pages-artifact@v3
-              with:
-                  path: crates/mev-dashboard/dist
+            - name: Add .nojekyll
+              run: touch crates/mev-dashboard/dist/.nojekyll
 
-    deploy:
-        needs: build
-        runs-on: ubuntu-latest
-        environment:
-            name: github-pages
-            url: ${{ steps.deployment.outputs.page_url }}
-        steps:
-            - name: Deploy to GitHub Pages
-              id: deployment
-              uses: actions/deploy-pages@v4
+            - name: Deploy to gh-pages branch
+              uses: JamesIves/github-pages-deploy-action@v4
+              with:
+                  branch: gh-pages
+                  folder: crates/mev-dashboard/dist
+                  clean: true

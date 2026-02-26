@@ -119,16 +119,10 @@ pub fn setup(props: &SetupProps) -> Html {
 
             let rpc_url = match (*provider).as_str() {
                 "alchemy" => {
-                    format!(
-                        "https://eth-mainnet.g.alchemy.com/v2/{}",
-                        (*api_key).trim()
-                    )
+                    format!("https://eth-mainnet.g.alchemy.com/v2/{}", (*api_key).trim())
                 }
                 "infura" => {
-                    format!(
-                        "https://mainnet.infura.io/v3/{}",
-                        (*api_key).trim()
-                    )
+                    format!("https://mainnet.infura.io/v3/{}", (*api_key).trim())
                 }
                 _ => (*custom_url).trim().to_string(),
             };

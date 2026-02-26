@@ -36,11 +36,7 @@ pub fn results(props: &ResultsProps) -> Html {
         .iter()
         .filter(|o| o.mev_type == MevType::Sandwich)
         .count();
-    let total_profit: f64 = r
-        .opportunities
-        .iter()
-        .map(|o| o.estimated_profit_eth)
-        .sum();
+    let total_profit: f64 = r.opportunities.iter().map(|o| o.estimated_profit_eth).sum();
     let misordered = r
         .ordering_analysis
         .iter()
