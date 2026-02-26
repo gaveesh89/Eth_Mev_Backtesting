@@ -17,7 +17,7 @@ version = "0.1.0"
 alloy = "0.12"
 revm = "19"
 arrow = "53"
-parquet = "53"
+parquet = "58"
 rusqlite = "0.32"
 tokio = { version = "1", features = ["fs", "io-util", "rt"] }
 clap = "4"
