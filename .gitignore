@@ -33,3 +33,7 @@ test_data/
 # Large data files (>50MB)
 data/cex/*.csv
 data/mempool/*.parquet
+
+# Dashboard build output (deployed via GitHub Actions)
+crates/mev-dashboard/dist/
+crates/mev-dashboard/target/

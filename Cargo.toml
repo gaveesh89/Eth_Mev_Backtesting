@@ -6,6 +6,9 @@ members = [
   "crates/mev-cli",
   "tests",
 ]
+exclude = [
+  "crates/mev-dashboard",  # WASM-only — build with `trunk build` (see crates/mev-dashboard/README.md)
+]
 resolver = "2"
 
 [workspace.package]
