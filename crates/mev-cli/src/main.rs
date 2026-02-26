@@ -8,6 +8,7 @@ use mev_analysis::pnl::{compute_pnl, compute_range_stats, format_eth};
 use mev_analysis::scc_detector::detect_arbitrage;
 use mev_analysis::transfer_graph::{parse_transfer_log, TxTransferGraph};
 use mev_data::blocks::BlockFetcher;
+use mev_data::cex::{fetch_binance_klines, klines_to_insert_tuples};
 use mev_data::mempool::download_and_store;
 use mev_data::store::{IntraBlockArbRow, Store};
 use mev_sim::decoder::addresses;
@@ -47,6 +48,8 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Commands {
     Fetch(FetchArgs),
+    /// Fetch CEX kline data from Binance API for a block range.
+    FetchCex(FetchCexArgs),
     IngestCex(IngestCexArgs),
     Simulate(SimulateArgs),
     Analyze(AnalyzeArgs),
@@ -81,6 +84,34 @@ struct SimulateArgs {
 
     #[arg(long, default_value = "egp")]
     algorithm: String,
+}
+
+/// Arguments for the `fetch-cex` subcommand.
+///
+/// Automatically fetches Binance 1-second klines for the time window
+/// corresponding to the given block range. Blocks must already be stored
+/// in the database (run `fetch` first).
+#[derive(Args, Debug)]
+struct FetchCexArgs {
+    /// Starting block number (must already be in database).
+    #[arg(long)]
+    start_block: u64,
+
+    /// Ending block number (inclusive, must already be in database).
+    #[arg(long)]
+    end_block: u64,
+
+    /// Binance trading pair symbol (default: ETHUSDC).
+    #[arg(long, default_value = "ETHUSDC")]
+    pair: String,
+
+    /// Kline interval (default: 1s). Supported: 1s, 1m, 3m, 5m, 15m, 30m, 1h, etc.
+    #[arg(long, default_value = "1s")]
+    interval: String,
+
+    /// Extra seconds of padding before/after block timestamps (default: 10).
+    #[arg(long, default_value = "10")]
+    padding_seconds: u64,
 }
 
 #[derive(Args, Debug)]
@@ -174,6 +205,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Fetch(args) => handle_fetch(&ctx, args).await,
+        Commands::FetchCex(args) => handle_fetch_cex(&ctx, args).await,
         Commands::IngestCex(args) => handle_ingest_cex(&ctx, args).await,
         Commands::Simulate(args) => handle_simulate(&ctx, args).await,
         Commands::Analyze(args) => handle_analyze(&ctx, args).await,
@@ -253,6 +285,79 @@ async fn handle_fetch(ctx: &AppContext, args: FetchArgs) -> Result<()> {
         mempool_inserted,
         db_path = %ctx.db_path,
         "fetch command finished"
+    );
+
+    Ok(())
+}
+
+/// Fetches Binance kline data for the time window covering a stored block range.
+///
+/// Looks up the timestamps of the start and end blocks from SQLite, adds
+/// configurable padding, then calls the Binance public kline API.
+///
+/// # Errors
+///
+/// Returns error if blocks are not in the database, or if the Binance API
+/// request fails.
+async fn handle_fetch_cex(ctx: &AppContext, args: FetchCexArgs) -> Result<()> {
+    let store = Store::new(&ctx.db_path).wrap_err("failed to open SQLite store")?;
+
+    // Look up block timestamps from the database
+    let start_block = store
+        .get_block(args.start_block)
+        .wrap_err("failed to query start block")?
+        .ok_or_else(|| {
+            eyre!(
+                "block {} not found in database — run `fetch` first",
+                args.start_block
+            )
+        })?;
+
+    let end_block = store
+        .get_block(args.end_block)
+        .wrap_err("failed to query end block")?
+        .ok_or_else(|| {
+            eyre!(
+                "block {} not found in database — run `fetch` first",
+                args.end_block
+            )
+        })?;
+
+    let start_ts = start_block.timestamp.saturating_sub(args.padding_seconds);
+    let end_ts = end_block.timestamp.saturating_add(args.padding_seconds);
+
+    info!(
+        start_block = args.start_block,
+        end_block = args.end_block,
+        start_ts,
+        end_ts,
+        pair = %args.pair,
+        interval = %args.interval,
+        "fetching Binance klines for block range"
+    );
+
+    let klines = fetch_binance_klines(&args.pair, &args.interval, start_ts, end_ts)
+        .await
+        .wrap_err("failed to fetch Binance klines")?;
+
+    if klines.is_empty() {
+        info!("no klines returned for the given range");
+        return Ok(());
+    }
+
+    // Insert into SQLite
+    let tuples = klines_to_insert_tuples(&klines);
+    let inserted = store
+        .insert_cex_prices(&tuples)
+        .wrap_err("failed to insert CEX prices")?;
+
+    info!(
+        klines_fetched = klines.len(),
+        rows_inserted = inserted,
+        pair = %args.pair,
+        interval = %args.interval,
+        time_range_s = end_ts - start_ts,
+        "fetch-cex completed"
     );
 
     Ok(())

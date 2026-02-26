@@ -164,6 +164,49 @@ MEV_ENABLE_V3=1 cargo run -- v3-price --pool 0x8ad599c3A0ff1De082011EFDDc58f1908
 
 ---
 
+## Automated CEX Data Fetching (Binance Klines)
+
+**Status: PASS**
+
+Replaces the manual CSV download workflow with a CLI command that fetches Binance klines directly via the public REST API. No API key required.
+
+- **Endpoint**: `GET https://data-api.binance.vision/api/v3/klines` — weight 2, max 1000 rows per request
+- **Pagination**: Automatic — advances `startTime` past last returned `open_time`, sleeps 250ms between pages
+- **Rate-limit handling**: Backs off on HTTP 429/418, respects `Retry-After` header
+- **Price conversion**: f64 → micro-USD (×10⁶) at intake boundary (matches existing CSV ingestor)
+- **Storage**: Reuses `Store::insert_cex_prices()` with `INSERT OR REPLACE` into `cex_prices` table
+- **Time window**: Looks up block timestamps from SQLite, adds configurable padding (default 10s)
+
+### Files
+
+| File | Purpose |
+|------|---------|
+| `crates/mev-data/src/cex.rs` | `CexKline` struct, `fetch_binance_klines()`, pagination, rate-limit retry |
+| `crates/mev-cli/src/main.rs` | `fetch-cex` CLI command with `FetchCexArgs` |
+
+### Test results
+
+| Test | Result |
+|------|--------|
+| `cex::tests::parse_kline_row_valid`         | PASS — parses well-formed kline array |
+| `cex::tests::parse_kline_row_short_array`   | PASS — returns None for truncated input |
+| `cex::tests::parse_kline_row_bad_price`     | PASS — returns None for non-numeric price |
+| `cex::tests::klines_to_tuples_roundtrip`    | PASS — round-trips through insert-tuple format |
+| `cex::tests::micro_usd_precision`           | PASS — f64→i64 micro-USD conversion accuracy |
+
+### Run commands
+
+```bash
+# Unit tests (no network needed):
+cargo nextest run -p mev-data cex
+
+# CLI usage (requires mev.sqlite with block timestamps):
+cargo run -- --db-path data/mev.sqlite fetch-cex --start-block 16817000 --end-block 16817099
+cargo run -- --db-path data/mev.sqlite fetch-cex --start-block 16817000 --end-block 16817099 --pair ETHUSDC --interval 1s --padding-seconds 10
+```
+
+---
+
 ## Instrumentation
 
 ```bash
