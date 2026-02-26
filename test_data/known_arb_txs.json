@@ -17,7 +17,15 @@
     ],
     "verified_gross_profit_wei": "0",
     "verified_net_profit_wei": "-184835279519590790",
-    "verified_gas_cost_wei": "184835279519590790"
+    "verified_gas_cost_wei": "184835279519590790",
+    "classification": "UNKNOWN",
+    "classification_signals": {
+      "cyclic_flow": false,
+      "tx_position": 62,
+      "tx_position_label": "MID_BLOCK",
+      "contract_caller_count": 1,
+      "contract_caller_label": "PRIVATE_CONTRACT"
+    }
   },
   {
     "block_number": 15537582,
@@ -37,7 +45,15 @@
     ],
     "verified_gross_profit_wei": "0",
     "verified_net_profit_wei": "-80122251867610680",
-    "verified_gas_cost_wei": "80122251867610680"
+    "verified_gas_cost_wei": "80122251867610680",
+    "classification": "UNKNOWN",
+    "classification_signals": {
+      "cyclic_flow": false,
+      "tx_position": 57,
+      "tx_position_label": "MID_BLOCK",
+      "contract_caller_count": 38,
+      "contract_caller_label": "SEMI_PRIVATE"
+    }
   },
   {
     "block_number": 15537616,
@@ -56,7 +72,15 @@
     ],
     "verified_gross_profit_wei": "86501934700924436",
     "verified_net_profit_wei": "40926730536472164",
-    "verified_gas_cost_wei": "45575204164452272"
+    "verified_gas_cost_wei": "45575204164452272",
+    "classification": "MEV_BOT",
+    "classification_signals": {
+      "cyclic_flow": true,
+      "tx_position": 106,
+      "tx_position_label": "MID_BLOCK",
+      "contract_caller_count": 12,
+      "contract_caller_label": "SEMI_PRIVATE"
+    }
   },
   {
     "block_number": 15537913,
@@ -75,7 +99,15 @@
     ],
     "verified_gross_profit_wei": "0",
     "verified_net_profit_wei": "-18300617527772760",
-    "verified_gas_cost_wei": "18300617527772760"
+    "verified_gas_cost_wei": "18300617527772760",
+    "classification": "UNKNOWN",
+    "classification_signals": {
+      "cyclic_flow": false,
+      "tx_position": 212,
+      "tx_position_label": "MID_BLOCK",
+      "contract_caller_count": 48,
+      "contract_caller_label": "SEMI_PRIVATE"
+    }
   },
   {
     "block_number": 15538813,
@@ -96,7 +128,15 @@
     ],
     "verified_gross_profit_wei": "31351601567370040836",
     "verified_net_profit_wei": "31342304379289101422",
-    "verified_gas_cost_wei": "9297188080939414"
+    "verified_gas_cost_wei": "9297188080939414",
+    "classification": "MEV_BOT",
+    "classification_signals": {
+      "cyclic_flow": true,
+      "tx_position": 429,
+      "tx_position_label": "MID_BLOCK",
+      "contract_caller_count": 12,
+      "contract_caller_label": "SEMI_PRIVATE"
+    }
   },
   {
     "block_number": 15538813,
@@ -117,7 +157,15 @@
     ],
     "verified_gross_profit_wei": "31351601567370040836",
     "verified_net_profit_wei": "31342304379289101422",
-    "verified_gas_cost_wei": "9297188080939414"
+    "verified_gas_cost_wei": "9297188080939414",
+    "classification": "MEV_BOT",
+    "classification_signals": {
+      "cyclic_flow": true,
+      "tx_position": 429,
+      "tx_position_label": "MID_BLOCK",
+      "contract_caller_count": 12,
+      "contract_caller_label": "SEMI_PRIVATE"
+    }
   },
   {
     "block_number": 15539280,
@@ -136,6 +184,14 @@
     ],
     "verified_gross_profit_wei": "0",
     "verified_net_profit_wei": "-3848760024962787",
-    "verified_gas_cost_wei": "3848760024962787"
+    "verified_gas_cost_wei": "3848760024962787",
+    "classification": "AGGREGATOR",
+    "classification_signals": {
+      "cyclic_flow": false,
+      "tx_position": 64,
+      "tx_position_label": "MID_BLOCK",
+      "contract_caller_count": 65,
+      "contract_caller_label": "PUBLIC_ROUTER"
+    }
   }
 ]

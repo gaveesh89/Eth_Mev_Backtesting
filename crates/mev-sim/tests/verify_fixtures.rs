@@ -58,6 +58,23 @@ const TRACKED_POOLS: &[(&str, &str)] = &[
     ),
 ];
 
+/// Classification signals collected per fixture tx.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct ClassificationSignals {
+    /// Does the tx sender/contract end with more of the token it started with?
+    cyclic_flow: bool,
+    /// Transaction index inside the block.
+    tx_position: u64,
+    /// Human label for block position.
+    tx_position_label: String,
+    /// Number of unique callers to `tx.to` contract (0 = not checked).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    contract_caller_count: Option<u64>,
+    /// Label for the contract caller pattern.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    contract_caller_label: Option<String>,
+}
+
 /// Fixture entry as stored in `known_arb_txs.json`.
 ///
 /// Fields are a superset: the original fields plus optional verification metadata
@@ -91,6 +108,12 @@ struct KnownArbTx {
     verified_net_profit_wei: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     verified_gas_cost_wei: Option<String>,
+
+    // --- MEV classification ---
+    #[serde(skip_serializing_if = "Option::is_none")]
+    classification: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    classification_signals: Option<ClassificationSignals>,
 }
 
 /// Etherscan API response for getLogs / proxy calls.
@@ -196,6 +219,14 @@ fn parse_hex_u128(value: &str) -> Option<u128> {
     u128::from_str_radix(trimmed, 16).ok()
 }
 
+/// Parse a `0x`-prefixed hex string into u64.
+fn parse_hex_u64(value: &str) -> Option<u64> {
+    let hex = value.strip_prefix("0x").unwrap_or(value);
+    let trimmed = hex.trim_start_matches('0');
+    let trimmed = if trimmed.is_empty() { "0" } else { trimmed };
+    u64::from_str_radix(trimmed, 16).ok()
+}
+
 /// Balance-delta map: `address → (token_address → signed_balance_change)`.
 ///
 /// Positive values = net inflow, negative = net outflow.
@@ -262,6 +293,194 @@ fn build_balance_deltas(logs: &[serde_json::Value]) -> BalanceDeltaMap {
     }
 
     deltas
+}
+
+// ---------------------------------------------------------------------------
+//  Cyclic-flow detection
+// ---------------------------------------------------------------------------
+
+/// A single Transfer event in log-index order.
+#[derive(Debug, Clone)]
+struct TransferEvent {
+    token: String,
+    from: String,
+    #[allow(dead_code)]
+    to: String,
+    #[allow(dead_code)]
+    amount: u128,
+    log_index: u64,
+}
+
+/// Extract ordered Transfer events from receipt logs.
+fn extract_ordered_transfers(logs: &[serde_json::Value]) -> Vec<TransferEvent> {
+    let mut transfers = Vec::new();
+    for log in logs {
+        let topics: Vec<String> = log
+            .get("topics")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|t| t.as_str().map(|s| s.to_lowercase()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if topics.len() < 3 || topics[0] != TRANSFER_TOPIC {
+            continue;
+        }
+        let token = log
+            .get("address")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_lowercase())
+            .unwrap_or_default();
+        let from = match address_from_topic(&topics[1]) {
+            Some(a) => a,
+            None => continue,
+        };
+        let to = match address_from_topic(&topics[2]) {
+            Some(a) => a,
+            None => continue,
+        };
+        let data_hex = log.get("data").and_then(|v| v.as_str()).unwrap_or("0x0");
+        let amount = match decode_transfer_amount(data_hex) {
+            Some(a) => a,
+            None => continue,
+        };
+        let log_index = log
+            .get("logIndex")
+            .and_then(|v| v.as_str())
+            .and_then(parse_hex_u64)
+            .unwrap_or(0);
+        transfers.push(TransferEvent {
+            token,
+            from,
+            to,
+            amount,
+            log_index,
+        });
+    }
+    transfers.sort_by_key(|t| t.log_index);
+    transfers
+}
+
+/// Determine whether the tx exhibits cyclic token flow.
+///
+/// Cyclic: sender or contract sends token X first, ends with positive delta for token X.
+fn is_cyclic_flow(
+    sender: &str,
+    contract: &str,
+    transfers: &[TransferEvent],
+    deltas: &BalanceDeltaMap,
+) -> bool {
+    let first_outbound = transfers
+        .iter()
+        .find(|t| t.from == sender || t.from == contract);
+    let first_token = match first_outbound {
+        Some(t) => &t.token,
+        None => return false,
+    };
+    let sender_delta = deltas
+        .get(sender)
+        .and_then(|m| m.get(first_token))
+        .copied()
+        .unwrap_or(0);
+    let contract_delta = deltas
+        .get(contract)
+        .and_then(|m| m.get(first_token))
+        .copied()
+        .unwrap_or(0);
+    sender_delta > 0 || contract_delta > 0
+}
+
+// ---------------------------------------------------------------------------
+//  Classification helpers
+// ---------------------------------------------------------------------------
+
+/// Classify tx block position.
+fn tx_position_label(tx_index: u64) -> &'static str {
+    if tx_index <= 3 {
+        "TOP_OF_BLOCK"
+    } else if tx_index <= 10 {
+        "NEAR_TOP"
+    } else {
+        "MID_BLOCK"
+    }
+}
+
+/// Classify based on unique caller count.
+fn caller_count_label(count: u64) -> &'static str {
+    if count <= 5 {
+        "PRIVATE_CONTRACT"
+    } else if count > 50 {
+        "PUBLIC_ROUTER"
+    } else {
+        "SEMI_PRIVATE"
+    }
+}
+
+/// Combine signals into a final label: MEV_BOT, AGGREGATOR, or UNKNOWN.
+fn classify_from_signals(signals: &ClassificationSignals) -> &'static str {
+    let mut mev_score: i32 = 0;
+    let mut agg_score: i32 = 0;
+
+    if signals.cyclic_flow {
+        mev_score += 2;
+    } else {
+        agg_score += 1;
+    }
+
+    match signals.tx_position_label.as_str() {
+        "TOP_OF_BLOCK" => mev_score += 2,
+        "NEAR_TOP" => mev_score += 1,
+        "MID_BLOCK" => agg_score += 1,
+        _ => {}
+    }
+
+    if let Some(ref label) = signals.contract_caller_label {
+        match label.as_str() {
+            "PRIVATE_CONTRACT" => mev_score += 2,
+            "PUBLIC_ROUTER" => agg_score += 2,
+            "SEMI_PRIVATE" => mev_score += 1,
+            _ => {}
+        }
+    }
+
+    if mev_score > agg_score + 1 {
+        "MEV_BOT"
+    } else if agg_score > mev_score + 1 {
+        "AGGREGATOR"
+    } else {
+        "UNKNOWN"
+    }
+}
+
+/// Fetch the number of unique callers to a contract address.
+///
+/// Uses `module=account&action=txlist` with a small page size.
+/// Returns `None` on error (non-fatal; signal is optional).
+async fn fetch_unique_caller_count(
+    client: &reqwest::Client,
+    api_key: &str,
+    contract_address: &str,
+) -> Option<u64> {
+    let url = format!(
+        "https://api.etherscan.io/v2/api?chainid=1&module=account&action=txlist\
+         &address={addr}&startblock=0&endblock=99999999\
+         &page=1&offset=100&sort=desc&apikey={key}",
+        addr = contract_address,
+        key = api_key,
+    );
+    let resp = client.get(&url).send().await.ok()?;
+    let body: EtherscanResponse = resp.json().await.ok()?;
+    let txs = body.result?.as_array().cloned().unwrap_or_default();
+    let unique_from: HashSet<String> = txs
+        .iter()
+        .filter_map(|tx| {
+            tx.get("from")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_lowercase())
+        })
+        .collect();
+    Some(unique_from.len() as u64)
 }
 
 /// Fetch a transaction receipt from Etherscan's `eth_getTransactionReceipt` proxy.
@@ -780,6 +999,123 @@ async fn verify_fixtures_on_etherscan() {
         f.verified_gas_cost_wei = Some(gas_cost_wei.to_string());
     }
 
+    // ---- Phase 4: MEV classification ----
+    eprintln!(
+        "\n=== MEV CLASSIFICATION ({} confirmed fixtures) ===\n",
+        confirmed_fixtures.len()
+    );
+    eprintln!(
+        "{:<12} | {:<8} | {:<6} | {:<15} | {:<7} | {:<18} | {:<12} | classification",
+        "tx_hash", "block", "idx", "position", "cyclic", "contract_callers", "caller_label",
+    );
+    eprintln!("{}", "-".repeat(130));
+
+    let mut mev_bot_count: usize = 0;
+    let mut aggregator_count: usize = 0;
+    let mut unknown_count: usize = 0;
+    let mut caller_count_cache: HashMap<String, Option<u64>> = HashMap::new();
+
+    for &idx in &confirmed_fixtures {
+        let fixture = &fixtures[idx];
+        let arb_tx_hash = fixture
+            .actual_arb_tx_hash
+            .as_deref()
+            .unwrap_or(&fixture.tx_hash)
+            .to_lowercase();
+
+        let receipt = match receipt_cache.get(&arb_tx_hash) {
+            Some(r) => r,
+            None => {
+                eprintln!("  [SKIP] {}… — no cached receipt", &arb_tx_hash[..10]);
+                continue;
+            }
+        };
+
+        let logs = receipt
+            .get("logs")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        let tx_sender = receipt
+            .get("from")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_lowercase())
+            .unwrap_or_default();
+        let arb_contract = receipt
+            .get("to")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_lowercase())
+            .unwrap_or_default();
+
+        // 1. CYCLIC FLOW CHECK
+        let deltas = build_balance_deltas(&logs);
+        let transfers = extract_ordered_transfers(&logs);
+        let cyclic = is_cyclic_flow(&tx_sender, &arb_contract, &transfers, &deltas);
+
+        // 2. TX POSITION CHECK
+        let tx_index_val = receipt
+            .get("transactionIndex")
+            .and_then(|v| v.as_str())
+            .and_then(parse_hex_u64)
+            .unwrap_or(fixture.tx_index);
+        let pos_label = tx_position_label(tx_index_val);
+
+        // 3. CONTRACT CALLER CHECK (extra API call, cached per contract)
+        let caller_count = if !arb_contract.is_empty()
+            && arb_contract != "0x0000000000000000000000000000000000000000"
+        {
+            if let Some(cached) = caller_count_cache.get(&arb_contract) {
+                *cached
+            } else {
+                tokio::time::sleep(Duration::from_millis(220)).await;
+                let count = fetch_unique_caller_count(&client, &api_key, &arb_contract).await;
+                caller_count_cache.insert(arb_contract.clone(), count);
+                count
+            }
+        } else {
+            None
+        };
+
+        let caller_label = caller_count.map(caller_count_label);
+
+        let signals = ClassificationSignals {
+            cyclic_flow: cyclic,
+            tx_position: tx_index_val,
+            tx_position_label: pos_label.to_string(),
+            contract_caller_count: caller_count,
+            contract_caller_label: caller_label.map(|s| s.to_string()),
+        };
+
+        let classification = classify_from_signals(&signals);
+        match classification {
+            "MEV_BOT" => mev_bot_count += 1,
+            "AGGREGATOR" => aggregator_count += 1,
+            _ => unknown_count += 1,
+        }
+
+        let short_hash = format!("{}…", &arb_tx_hash[..10]);
+        let cc_display = caller_count
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "N/A".to_string());
+        let cl_display = caller_label.unwrap_or("N/A");
+        eprintln!(
+            "{:<12} | {:<8} | {:<6} | {:<15} | {:<7} | {:<18} | {:<12} | {}",
+            short_hash,
+            fixture.block_number,
+            tx_index_val,
+            pos_label,
+            cyclic,
+            cc_display,
+            cl_display,
+            classification,
+        );
+
+        let f = &mut fixtures[idx];
+        f.classification = Some(classification.to_string());
+        f.classification_signals = Some(signals);
+    }
+
     // ---- Write enriched JSON back ----
     let enriched_json =
         serde_json::to_string_pretty(&fixtures).expect("fixture serialization should succeed");
@@ -800,6 +1136,11 @@ async fn verify_fixtures_on_etherscan() {
     eprintln!("  Profit verified (match): {}", profit_match_count);
     eprintln!("  Profit deviation (>10%): {}", profit_mismatch_count);
     eprintln!("  Profit fetch errors:     {}", profit_error_count);
+    eprintln!();
+    eprintln!("=== MEV CLASSIFICATION ===");
+    eprintln!("  MEV_BOT:                 {}", mev_bot_count);
+    eprintln!("  AGGREGATOR:              {}", aggregator_count);
+    eprintln!("  UNKNOWN:                 {}", unknown_count);
 
     // Soft assertion: all fixtures got a verification status
     assert!(
@@ -1018,4 +1359,215 @@ fn build_balance_deltas_tracks_multiple_tokens() {
             .unwrap_or(0),
         -1_500_000_000i128
     );
+}
+
+// ---------- classification unit tests ----------
+
+#[test]
+fn classify_cyclic_top_of_block_private_is_mev_bot() {
+    let signals = ClassificationSignals {
+        cyclic_flow: true,
+        tx_position: 1,
+        tx_position_label: "TOP_OF_BLOCK".to_string(),
+        contract_caller_count: Some(3),
+        contract_caller_label: Some("PRIVATE_CONTRACT".to_string()),
+    };
+    assert_eq!(classify_from_signals(&signals), "MEV_BOT");
+}
+
+#[test]
+fn classify_non_cyclic_mid_block_public_is_aggregator() {
+    let signals = ClassificationSignals {
+        cyclic_flow: false,
+        tx_position: 50,
+        tx_position_label: "MID_BLOCK".to_string(),
+        contract_caller_count: Some(100),
+        contract_caller_label: Some("PUBLIC_ROUTER".to_string()),
+    };
+    assert_eq!(classify_from_signals(&signals), "AGGREGATOR");
+}
+
+#[test]
+fn classify_mixed_signals_is_unknown() {
+    let signals = ClassificationSignals {
+        cyclic_flow: true,
+        tx_position: 50,
+        tx_position_label: "MID_BLOCK".to_string(),
+        contract_caller_count: Some(100),
+        contract_caller_label: Some("PUBLIC_ROUTER".to_string()),
+    };
+    assert_eq!(classify_from_signals(&signals), "UNKNOWN");
+}
+
+#[test]
+fn classify_cyclic_top_no_caller_data_is_mev_bot() {
+    let signals = ClassificationSignals {
+        cyclic_flow: true,
+        tx_position: 0,
+        tx_position_label: "TOP_OF_BLOCK".to_string(),
+        contract_caller_count: None,
+        contract_caller_label: None,
+    };
+    assert_eq!(classify_from_signals(&signals), "MEV_BOT");
+}
+
+#[test]
+fn classify_non_cyclic_near_top_semi_private_is_unknown() {
+    let signals = ClassificationSignals {
+        cyclic_flow: false,
+        tx_position: 5,
+        tx_position_label: "NEAR_TOP".to_string(),
+        contract_caller_count: Some(20),
+        contract_caller_label: Some("SEMI_PRIVATE".to_string()),
+    };
+    // agg+1 (non-cyclic), mev+1 (near_top), mev+1 (semi-private) → mev=2, agg=1 → UNKNOWN
+    assert_eq!(classify_from_signals(&signals), "UNKNOWN");
+}
+
+#[test]
+fn is_cyclic_flow_detects_weth_round_trip() {
+    let sender = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let contract = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let transfers = vec![
+        TransferEvent {
+            token: WETH_ADDRESS.to_string(),
+            from: sender.to_string(),
+            to: contract.to_string(),
+            amount: 1_000_000_000_000_000_000,
+            log_index: 0,
+        },
+        TransferEvent {
+            token: WETH_ADDRESS.to_string(),
+            from: contract.to_string(),
+            to: sender.to_string(),
+            amount: 1_050_000_000_000_000_000,
+            log_index: 5,
+        },
+    ];
+    let mut deltas: BalanceDeltaMap = HashMap::new();
+    deltas
+        .entry(sender.to_string())
+        .or_default()
+        .insert(WETH_ADDRESS.to_string(), 50_000_000_000_000_000);
+    deltas
+        .entry(contract.to_string())
+        .or_default()
+        .insert(WETH_ADDRESS.to_string(), -50_000_000_000_000_000);
+    assert!(is_cyclic_flow(sender, contract, &transfers, &deltas));
+}
+
+#[test]
+fn is_cyclic_flow_rejects_one_way_swap() {
+    let sender = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let contract = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let usdc = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48";
+    let transfers = vec![
+        TransferEvent {
+            token: WETH_ADDRESS.to_string(),
+            from: sender.to_string(),
+            to: contract.to_string(),
+            amount: 1_000_000_000_000_000_000,
+            log_index: 0,
+        },
+        TransferEvent {
+            token: usdc.to_string(),
+            from: contract.to_string(),
+            to: sender.to_string(),
+            amount: 1_800_000_000,
+            log_index: 3,
+        },
+    ];
+    let mut deltas: BalanceDeltaMap = HashMap::new();
+    deltas
+        .entry(sender.to_string())
+        .or_default()
+        .insert(WETH_ADDRESS.to_string(), -1_000_000_000_000_000_000);
+    deltas
+        .entry(sender.to_string())
+        .or_default()
+        .insert(usdc.to_string(), 1_800_000_000);
+    assert!(!is_cyclic_flow(sender, contract, &transfers, &deltas));
+}
+
+#[test]
+fn is_cyclic_flow_detects_contract_profit() {
+    let sender = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let contract = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let transfers = vec![
+        TransferEvent {
+            token: WETH_ADDRESS.to_string(),
+            from: contract.to_string(),
+            to: "0xpool1".to_string(),
+            amount: 5_000_000_000_000_000_000,
+            log_index: 0,
+        },
+        TransferEvent {
+            token: WETH_ADDRESS.to_string(),
+            from: "0xpool2".to_string(),
+            to: contract.to_string(),
+            amount: 5_100_000_000_000_000_000,
+            log_index: 4,
+        },
+    ];
+    let mut deltas: BalanceDeltaMap = HashMap::new();
+    deltas
+        .entry(contract.to_string())
+        .or_default()
+        .insert(WETH_ADDRESS.to_string(), 100_000_000_000_000_000);
+    assert!(is_cyclic_flow(sender, contract, &transfers, &deltas));
+}
+
+#[test]
+fn tx_position_label_boundaries() {
+    assert_eq!(tx_position_label(0), "TOP_OF_BLOCK");
+    assert_eq!(tx_position_label(3), "TOP_OF_BLOCK");
+    assert_eq!(tx_position_label(4), "NEAR_TOP");
+    assert_eq!(tx_position_label(10), "NEAR_TOP");
+    assert_eq!(tx_position_label(11), "MID_BLOCK");
+    assert_eq!(tx_position_label(200), "MID_BLOCK");
+}
+
+#[test]
+fn caller_count_label_boundaries() {
+    assert_eq!(caller_count_label(0), "PRIVATE_CONTRACT");
+    assert_eq!(caller_count_label(5), "PRIVATE_CONTRACT");
+    assert_eq!(caller_count_label(6), "SEMI_PRIVATE");
+    assert_eq!(caller_count_label(50), "SEMI_PRIVATE");
+    assert_eq!(caller_count_label(51), "PUBLIC_ROUTER");
+    assert_eq!(caller_count_label(1000), "PUBLIC_ROUTER");
+}
+
+#[test]
+fn extract_ordered_transfers_sorts_by_log_index() {
+    let alice = "0x000000000000000000000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let bob = "0x000000000000000000000000bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let logs = vec![
+        serde_json::json!({
+            "address": WETH_ADDRESS,
+            "topics": [TRANSFER_TOPIC, alice, bob],
+            "data": format!("0x{:064x}", 100u128),
+            "logIndex": "0x5",
+        }),
+        serde_json::json!({
+            "address": WETH_ADDRESS,
+            "topics": [TRANSFER_TOPIC, bob, alice],
+            "data": format!("0x{:064x}", 200u128),
+            "logIndex": "0x2",
+        }),
+    ];
+    let transfers = extract_ordered_transfers(&logs);
+    assert_eq!(transfers.len(), 2);
+    assert_eq!(transfers[0].log_index, 2);
+    assert_eq!(transfers[0].amount, 200);
+    assert_eq!(transfers[1].log_index, 5);
+    assert_eq!(transfers[1].amount, 100);
+}
+
+#[test]
+fn parse_hex_u64_handles_common_patterns() {
+    assert_eq!(parse_hex_u64("0x0"), Some(0));
+    assert_eq!(parse_hex_u64("0x1"), Some(1));
+    assert_eq!(parse_hex_u64("0xa"), Some(10));
+    assert_eq!(parse_hex_u64("0xff"), Some(255));
+    assert_eq!(parse_hex_u64("0x00000003"), Some(3));
 }
