@@ -2,203 +2,309 @@
 
 Educational Rust toolkit for replaying historical Ethereum blocks and understanding MEV mechanics through simulation. **Analysis only — this project does NOT submit transactions to any relay, RPC, or network.**
 
+> **11,400+ lines of Rust** across 4 crates, **100 tests**, 3 MEV strategy scanners, 6 CLI subcommands.
+
 ## Prerequisites
 
-- **Rust**: 1.82+ (stable, `rustup default stable`)
-- **RPC endpoint**: Alchemy, Infura, or local Reth (for block fetching)
-- **Disk**: ~2GB for SQLite snapshots + Parquet caches
-- **Time**: 5–10 minutes per 1000-block backtest
+- **Rust** 1.82+ stable (`rustup default stable`)
+- **RPC endpoint** — Alchemy, Infura, or local Reth/Erigon (set via `MEV_RPC_URL`)
+- **Disk** — ~2 GB for the SQLite database
+- **Optional** — Binance CEX kline CSVs for CEX-DEX spread analysis
 
 ## Quick Start
 
 ### 1. Clone and Build
 ```bash
-git clone https://github.com/your-org/mev-backtest-toolkit.git
-cd mev-backtest-toolkit
+git clone https://github.com/gaveesh89/Eth_Mev_Backtesting.git
+cd Eth_Mev_Backtesting
 cargo build --release
 ```
 
-### 2. Fetch 1 Day of Mempool Data
+### 2. Fetch On-Chain Blocks
 ```bash
-export RPC_URL=https://eth-mainnet.g.alchemy.com/v2/YOUR_KEY
-cargo run --release --bin mev-cli -- \
-  download-mempool \
-  --date 2025-02-22 \
-  --data-dir ./data
-```
-(Downloads ~50MB Flashbots Parquet file)
+export MEV_RPC_URL=https://eth-mainnet.g.alchemy.com/v2/YOUR_KEY
 
-### 3. Fetch On-Chain Block Data
-```bash
 cargo run --release --bin mev-cli -- \
-  fetch-blocks \
-  --start-block 19500000 \
-  --end-block 19500010 \
-  --rpc-url "$RPC_URL" \
-  --db-path ./data/mev.db
+  fetch --start-block 17000000 --end-block 17000010
 ```
 
-### 4. Simulate Block Execution
+### 3. Ingest CEX Prices (optional)
 ```bash
 cargo run --release --bin mev-cli -- \
-  simulate \
-  --block 19500005 \
-  --db-path ./data/mev.db \
-  --algorithm egp
+  ingest-cex --csv data/ETHUSDT-1s-2023-04-14.csv
 ```
+
+### 4. Simulate a Block
+```bash
+cargo run --release --bin mev-cli -- \
+  simulate --block 17000000 --algorithm egp
+```
+Algorithms: `egp` (Effective Gas Price sort), `profit` (MEV-profit sort).
 
 ### 5. Analyze Results
 ```bash
 cargo run --release --bin mev-cli -- \
-  status \
-  --db-path ./data/mev.db
+  analyze --start-block 17000000 --end-block 17000010
 ```
 
-Output shows: blocks ingested, simulated MEV, P&L capture rates.
+### 6. Diagnose Scanner Coverage
+```bash
+cargo run --release --bin mev-cli -- \
+  diagnose --block 17000000
+```
+Reports V2/V3 swap event counts, scanned vs unscanned pool coverage, cross-DEX spreads, reserve health, and CEX timestamp alignment.
+
+### 7. Check Database Status
+```bash
+cargo run --release --bin mev-cli -- status
+```
 
 ---
 
 ## Architecture
 
-```mermaid
-flowchart LR
-    A["Flashbots<br/>Mempool-Dumpster<br/>(Parquet)"]
-    B["Ethereum RPC<br/>(Alloy)"]
-    C["mev-data:<br/>SQLite Store<br/>(WAL mode)"]
-    D["mev-sim:<br/>REVM Fork<br/>+ Strategies"]
-    E["mev-analysis:<br/>P&L Compute<br/>Classification"]
-    F["mev-cli:<br/>Output<br/>Tables/JSON"]
-    
-    A -->|Download| C
-    B -->|Fetch| C
-    C -->|Load txs| D
-    D -->|SimResult| C
-    C -->|Read| E
-    E -->|BlockPnL| C
-    C -->|Query| F
+```
+Ethereum RPC ──fetch──▶ ┌──────────────┐
+(Alloy provider)        │   mev-data   │
+                        │  SQLite WAL  │◀── ingest-cex ── Binance CSV
+Flashbots Parquet ──────▶│  Store layer │
+                        └──────┬───────┘
+                               │ load txs + reserves
+                               ▼
+                        ┌──────────────┐
+                        │   mev-sim    │
+                        │  REVM fork   │
+                        │  + Strategies│
+                        └──────┬───────┘
+                               │ SimResult, MevOpportunity
+                               ▼
+                        ┌──────────────┐
+                        │ mev-analysis │
+                        │  P&L, classify│
+                        └──────┬───────┘
+                               │ BlockPnL, MevClassification
+                               ▼
+                        ┌──────────────┐
+                        │   mev-cli    │
+                        │ table/JSON/CSV│
+                        └──────────────┘
 ```
 
-**Flow:**
-1. **Ingest**: Fetch historical mempool data (Flashbots) and on-chain blocks (Alloy RPC)
-2. **Store**: Persist in SQLite with WAL mode for concurrent reads
-3. **Simulate**: Fork EVM at block N-1, apply ordering/strategies, compute results
-4. **Analyze**: Calculate P&L, capture rates, MEV classifications
-5. **Export**: JSON, CSV, ASCII tables via CLI
+**Pipeline:**
+1. **Fetch** — Download block headers, transactions, and receipts via Alloy RPC; optionally download Flashbots mempool Parquet files
+2. **Store** — Persist everything in SQLite (WAL mode) with tables for blocks, transactions, mempool, simulation results, MEV opportunities, CEX prices, and intra-block arbs
+3. **Simulate** — Fork EVM state at block N-1 via REVM, re-order transactions, execute strategies
+4. **Analyze** — Compute P&L capture rates, classify sandwich/arbitrage/backrun patterns
+5. **Export** — ASCII tables, JSON, or CSV output
+
+---
+
+## Workspace Structure
+
+```
+mev-backtest-toolkit/
+├── AGENTS.md                ← coding conventions & boundaries
+├── spec.md                  ← architecture reference & schema
+├── Cargo.toml               ← workspace root, pinned deps
+├── crates/
+│   ├── mev-data/            ← data ingestion (SQLite, Parquet, RPC)
+│   │   └── src/
+│   │       ├── blocks.rs    ← BlockFetcher (Alloy RPC)
+│   │       ├── mempool.rs   ← Flashbots Parquet parser
+│   │       ├── store.rs     ← SQLite Store (928 lines)
+│   │       └── types.rs     ← Block, BlockTransaction, MempoolTransaction
+│   ├── mev-sim/             ← simulation engine
+│   │   └── src/
+│   │       ├── evm.rs       ← EvmFork (REVM 19 state fork)
+│   │       ├── decoder.rs   ← V2/V3 swap calldata decoder
+│   │       ├── ordering.rs  ← EGP sort, profit sort, nonce constraints
+│   │       └── strategies/
+│   │           ├── arbitrage.rs      ← Cross-DEX V2 arb scanner
+│   │           ├── cex_dex_arb.rs    ← CEX-DEX spread scanner
+│   │           └── dex_dex_intra.rs  ← Intra-block DEX-DEX arb
+│   ├── mev-analysis/        ← post-simulation analytics
+│   │   └── src/
+│   │       ├── classify.rs  ← Sandwich/backrun/arb heuristic classifier
+│   │       └── pnl.rs       ← P&L computation, capture rates
+│   └── mev-cli/             ← binary entry point (clap 4)
+│       └── src/main.rs      ← 6 subcommands (~1,120 lines)
+├── tests/                   ← workspace-level integration tests
+│   ├── analysis.rs
+│   ├── arbitrage_correctness.rs
+│   └── simulation.rs
+├── scripts/                 ← Python diagnostic & research scripts
+├── docs/                    ← tutorials, math reference, glossary
+├── data/                    ← SQLite database (gitignored)
+└── sql/                     ← validation queries
+```
+
+---
+
+## CLI Reference
+
+| Subcommand | Description | Key Flags |
+|---|---|---|
+| `fetch` | Fetch blocks from RPC + optional mempool Parquet download | `--start-block`, `--end-block`, `--date`, `--data-dir` |
+| `ingest-cex` | Ingest Binance kline CSVs into SQLite | `--csv` (repeatable) |
+| `simulate` | Simulate a single block with ordering algorithm | `--block`, `--algorithm` (`egp`/`profit`) |
+| `analyze` | Analyze block range: P&L, MEV classification | `--start-block`, `--end-block`, `--output` |
+| `status` | Show database statistics, block counts, simulation state | `--block` (optional, for single block detail) |
+| `diagnose` | Audit scanner coverage: V2/V3 events, reserves, spreads | `--block` |
+
+**Global flags:** `--db-path` (default: `data/mev.sqlite`), `-v` (verbose, repeatable), `-q` (quiet)
+
+---
+
+## MEV Strategy Scanners
+
+### 1. Cross-DEX V2 Arbitrage (`arbitrage.rs`)
+
+Compares reserves across Uniswap V2 and SushiSwap V2 pools for the same token pair. Uses the constant-product AMM formula to compute optimal input and net profit after the 0.3% swap fee on both legs.
+
+- **Default pairs**: WETH/USDC, WETH/USDT, WETH/DAI (× 2 DEXes = 6 pools)
+- **Fee floor**: ~60 bps (two 0.3% swaps) — spreads below this are unprofitable
+- **State**: Reads reserves at block N-1 (pre-block snapshot)
+
+### 2. CEX-DEX Spread Scanner (`cex_dex_arb.rs`)
+
+Compares on-chain DEX mid-price against nearest Binance 1-second kline. Flags opportunities where the spread exceeds a configurable threshold (default: 30 bps).
+
+- **CEX source**: Binance ETHUSDT 1s klines ingested via `ingest-cex`
+- **Staleness window**: 3 seconds — CEX prices older than this are rejected
+- **Uses same pool set** as the cross-DEX scanner
+
+### 3. Intra-Block DEX-DEX Scanner (`dex_dex_intra.rs`)
+
+Tracks reserve changes within a single block by parsing V2 Sync events from transaction receipts. Builds a merged timeline of reserve states and checks for cross-DEX spread after each update.
+
+- **Detection**: Uses `Sync(uint112,uint112)` events per pool
+- **Same 6-pool universe** as cross-DEX scanner
+
+### Known Limitations
+
+All three scanners share structural limitations documented in each module:
+
+- **V2 only** — Uniswap V3, Curve, Balancer pools are not scanned
+- **3 token pairs** — Only WETH/{USDC, USDT, DAI}; long-tail altcoin pairs are invisible
+- **Pre-block reserves** — Reads state at N-1; misses intra-block state changes (except dex_dex_intra)
+- **No multi-hop** — Only 2-pool direct arbs; A→B→C→A cycles are not evaluated
+- **Post-PBS baseline** — The builder has already extracted most MEV before our snapshot
+- **EVM simulation is a stub** — Returns hardcoded gas; actual REVM execution not yet wired to strategy output
+- **Transaction logs are not stored** — Receipts are discarded by `BlockFetcher`; limits offline analysis
+
+The `diagnose` command quantifies these gaps for any given block.
+
+---
+
+## MEV Classification (mev-analysis)
+
+### Sandwich Detector
+
+Rolling 3-transaction window checks:
+1. `tx[0]` and `tx[2]` share the same sender; `tx[1]` has a different sender
+2. `tx[0]` buys token X, `tx[1]` swaps token X, `tx[2]` sells token X
+3. `tx[0]` and `tx[2]` have higher effective gas price than `tx[1]`
+
+Confidence: 0.9 (all 3 conditions), 0.6 (2 of 3). Results are deduplicated by overlapping tx hashes.
+
+### P&L Computation
+
+Computes per-block capture rates: simulated block value vs actual block value. Outputs `BlockPnL` with gas revenue, MEV captured, and ordering efficiency metrics.
 
 ---
 
 ## Key Concepts
 
-| Concept | Definition | Learn More |
-|---------|-----------|-----------|
-| MEV | Maximal Extractable Value: profit available from transaction ordering | [docs/mev-concepts-glossary.md](docs/mev-concepts-glossary.md#mev) |
-| Arbitrage | Two-pool DEX opportunity: buy low, sell high | [docs/mev-concepts-glossary.md](docs/mev-concepts-glossary.md#arbitrage) |
-| Sandwich Attack | Attacker front-runs + back-runs victim; captures spread | [docs/mev-concepts-glossary.md](docs/mev-concepts-glossary.md#sandwich-attack) |
-| Bundle | Atomic sequence of txs: all succeed or all revert | [docs/mev-concepts-glossary.md](docs/mev-concepts-glossary.md#bundle) |
-| Effective Gas Price (EGP) | min(maxFeePerGas, baseFee + priorityFeePerGas) for EIP-1559 | [docs/mev-concepts-glossary.md](docs/mev-concepts-glossary.md#effective-gas-price) |
-| Base Fee | Ethereum dynamic fee burned per gas; set by protocol | [docs/mev-concepts-glossary.md](docs/mev-concepts-glossary.md#base-fee) |
-| REVM | Ethereum Virtual Machine lib (Rust): fast execution, no networking | [REVM Docs](https://github.com/bluealloy/revm) |
-| Capture Rate | Simulated value ÷ actual block value; measure of ordering impact | [crates/mev-analysis/src/pnl.rs](crates/mev-analysis/src/pnl.rs#L187) |
+| Concept | Definition |
+|---------|-----------|
+| MEV | Maximal Extractable Value — profit available from transaction ordering |
+| Arbitrage | Two-pool DEX price discrepancy: buy low on pool A, sell high on pool B |
+| Sandwich | Front-run + back-run a victim tx to capture price impact |
+| EGP | Effective Gas Price: `min(maxFeePerGas, baseFee + priorityFee)` |
+| Capture Rate | Simulated value ÷ actual block value |
+| REVM | Rust EVM implementation for fast offline execution |
+
+See [docs/mev-concepts-glossary.md](docs/mev-concepts-glossary.md) for full glossary.
 
 ---
 
-## Comparison: This Toolkit vs. rbuilder vs. Brontes
+## Comparison: This Toolkit vs. rbuilder vs. EigenPhi
 
-| Aspect | This Toolkit | rbuilder | Brontes |
-|--------|--------------|----------|---------|
-| **Purpose** | Educational backtest + analysis | Production block builder | Closed-source MEV research |
-| **Language** | Rust (safe) | Rust + Go | Proprietary |
-| **Scope** | Historical replay only | Real-time ordering + relay | Real-time + API |
-| **Network Effect** | None (local SQLite) | Requires block relay | Requires relay infra |
-| **Complexity** | ~7k LOC | ~50k LOC | Unknown |
-| **Ordering Algorithms** | EGP, profit-sort, custom | Full PBS integration | Proprietary |
-| **MEV Detection** | Sandwich, arbitrage | Full spectrum (MEV-Inspect) | Research only |
-| **Gas Simulation** | REVM 19 (accurate) | REVM 19 | Proprietary |
-| **Output** | JSON, CSV, tables | Builder API | N/A |
+| Aspect | This Toolkit | rbuilder | EigenPhi |
+|--------|--------------|----------|----------|
+| **Purpose** | Educational backtest | Production block builder | MEV analytics platform |
+| **Language** | Rust | Rust | Proprietary |
+| **Detection** | Reserve-based (V2 pools) | Full PBS integration | Transfer-graph SCC (protocol-agnostic) |
+| **MEV Types** | Arb, sandwich, backrun | Full spectrum | Arb, sandwich, liquidation, flash loan |
+| **Pool Coverage** | 6 hardcoded V2 pools | All pools | All pools + all protocols |
+| **Data Source** | Alchemy/Infura RPC | Local Reth | Erigon archive node |
+| **Storage** | SQLite (local) | In-memory | Google Cloud |
+| **Scope** | Historical replay | Real-time building | Real-time + historical |
+| **LOC** | ~11.4k | ~50k | Unknown |
 | **License** | MIT | AGPL-3.0 | Proprietary |
 
-**When to use this toolkit:**
-- Learning MEV mechanics
-- Backtesting ordering strategies
-- Analyzing historical blocks without live RPC cost
-- Building custom MEV classifiers
+---
+
+## Tech Stack
+
+| Dependency | Version | Purpose |
+|---|---|---|
+| [alloy](https://github.com/alloy-rs/alloy) | 0.12 | Ethereum types & RPC provider |
+| [revm](https://github.com/bluealloy/revm) | 19 | EVM simulation engine |
+| [rusqlite](https://github.com/rusqlite/rusqlite) | 0.32 | SQLite storage (WAL mode) |
+| [parquet](https://github.com/apache/arrow-rs) | 53 | Flashbots mempool file parsing |
+| [clap](https://github.com/clap-rs/clap) | 4 | CLI argument parsing |
+| [tokio](https://github.com/tokio-rs/tokio) | 1 | Async runtime |
+| [eyre](https://github.com/eyre-rs/eyre) | 0.6 | Error handling |
+| [tracing](https://github.com/tokio-rs/tracing) | 0.1 | Structured logging |
+| [reqwest](https://github.com/seanmonstar/reqwest) | 0.12 | HTTP client |
+| [criterion](https://github.com/bheisler/criterion.rs) | 0.5 | Benchmarking |
 
 ---
 
 ## Performance Reference
 
-Benchmarks (MacBook Pro M1, release build):
+Benchmarks (Apple M1, release build):
 
-| Operation | Time | Notes |
-|-----------|------|-------|
-| Sort 100 txs by EGP | **15.5 µs** | Large mempool simulation |
-| Apply nonce constraints (50 txs) | **6.4 µs** | Filter gaps per sender |
-| Detect arbs (10 pools) | **3.2 µs** | All pairwise evaluations |
-| Format 10k Wei → ETH | **886 µs** | Typical analysis loop |
-| Single tx simulate (warm state) | **< 5ms** | REVM + state cache |
-| Fetch 1 block via RPC | **100–500ms** | Network-bound |
-| SQLite batch insert (1k rows) | **< 50ms** | WAL mode |
+| Operation | Time |
+|-----------|------|
+| Sort 100 txs by EGP | **15.5 µs** |
+| Apply nonce constraints (50 txs) | **6.4 µs** |
+| Detect arbs (10 pool pairs) | **3.2 µs** |
+| Single tx simulate (warm REVM state) | **< 5 ms** |
+| Fetch 1 block via RPC | **100–500 ms** |
+| SQLite batch insert (1k rows) | **< 50 ms** |
 
-**Scaling**: Process ~1000 blocks in 10–15 minutes with local RPC.
+~1000 blocks in 10–15 minutes with a local RPC node.
 
 ---
 
-## Contributing
+## Development
 
-### Adding a New MEV Strategy
+### Verification Gate (must pass before commits)
 
-1. **Define detection logic** in [crates/mev-sim/src/strategies/](crates/mev-sim/src/strategies/):
-   ```rust
-   // crates/mev-sim/src/strategies/my_strategy.rs
-   pub fn detect_my_opportunity(
-       txs: &[MempoolTransaction],
-       evm: &EvmFork,
-   ) -> Result<Vec<Opportunity>> {
-       // Scan for your pattern
-       // Return list of opportunities
-   }
-   ```
+```bash
+cargo check
+cargo clippy -- -D warnings
+cargo fmt --all
+cargo nextest run          # or: cargo test --workspace
+```
 
-2. **Add unit tests** (required by AGENTS.md):
-   ```rust
-   #[cfg(test)]
-   mod tests {
-       #[test]
-       fn detects_simple_case() { ... }
-   }
-   ```
+### Adding a New Strategy
 
-3. **Export from [lib.rs](crates/mev-sim/src/lib.rs)**:
-   ```rust
-   pub mod strategies;
-   pub use strategies::my_strategy;
-   ```
-
-4. **Integrate into CLI** in [crates/mev-cli/src/](crates/mev-cli/src/):
-   ```rust
-   let opportunities = my_strategy::detect_my_opportunity(&txs, &evm)?;
-   ```
-
-5. **Verify**:
-   ```bash
-   cargo check
-   cargo clippy -- -D warnings
-   cargo test --package mev-sim
-   ```
-
-6. **Commit** (after testing):
-   ```bash
-   git add -A
-   git commit -m "P-N: Add my-strategy detection"
-   ```
+1. Create `crates/mev-sim/src/strategies/my_strategy.rs`
+2. Add detection logic returning `eyre::Result<Vec<MevOpportunity>>`
+3. Write ≥1 unit test per public function
+4. Export from `strategies/mod.rs`
+5. Wire into CLI subcommand
+6. Run verification gate
 
 ### Code Standards
 
-- **Error handling**: Always use `eyre::Result` in library crates
-- **Logging**: `tracing::info!()` / `debug!()`, never `println!`
-- **Testing**: ≥1 unit test per public function (happy path minimum)
-- **Documentation**: `///` on all public items; module-level `//!` doc comments
-- **Benchmarking**: Use criterion if performance-critical
+- `eyre::Result` everywhere in library crates — never `unwrap()`
+- `tracing` macros only — never `println!`
+- `///` docs on all public items; `//!` module-level docs
+- `#[tracing::instrument]` on all public async functions
 
 See [AGENTS.md](AGENTS.md) for complete rules.
 
@@ -206,28 +312,29 @@ See [AGENTS.md](AGENTS.md) for complete rules.
 
 ## FAQ
 
-**Q: Why SQLite instead of PostgreSQL?**  
-A: Zero infrastructure; rbuilder uses same pattern. Fast for historical analysis.
+**Q: Why SQLite instead of PostgreSQL?**
+A: Zero infrastructure. rbuilder uses the same pattern. Ideal for local historical analysis.
 
-**Q: Can I use this to submit bundles?**  
-A: No. This project analysis-only. Add transaction submission at your own risk.
+**Q: Can I use this to submit bundles or trade?**
+A: No. This is analysis-only. It does not connect to any relay or submit transactions.
 
-**Q: How accurate is the REVM simulation?**  
-A: ~99% for transfers; contract opcodes require state injection. See `crates/mev-sim/src/evm.rs`.
+**Q: Why does the scanner find zero opportunities on some blocks?**
+A: The default scanner covers only 6 V2 pools (WETH/{USDC,USDT,DAI} on UniV2 + Sushi). Most real MEV activity occurs on V3 pools and long-tail pairs outside this set. Use `diagnose --block N` to quantify coverage gaps. In post-PBS Ethereum, the block builder has already extracted most residual arb before our snapshot.
 
-**Q: What's the latency for a full backtest?**  
-A: ~1 minute per 100 blocks with warm RPC cache. Network I/O dominates.
+**Q: What is the `diagnose` command?**
+A: It audits a block's swap activity — counts V2/V3 events, splits them by scanned vs unscanned pools, reads reserves, computes cross-DEX spreads, and checks CEX timestamp alignment. It tells you *why* the scanner did or didn't find opportunities.
 
 ---
 
 ## Resources
 
-- **Architecture**: [spec.md](spec.md)
-- **MEV Concepts**: [docs/mev-concepts-glossary.md](docs/mev-concepts-glossary.md)
-- **Coding Standards**: [AGENTS.md](AGENTS.md)
-- **Block Fetcher Plan**: [BLOCK_FETCHER_PLAN.md](BLOCK_FETCHER_PLAN.md)
-- **EVM Fork Plan**: [EVM_FORK_PLAN.md](EVM_FORK_PLAN.md)
-- **Mempool Parser Plan**: [MEMPOOL_PARSER_PLAN.md](MEMPOOL_PARSER_PLAN.md)
+- [spec.md](spec.md) — Architecture reference, schema, addresses, arb math
+- [AGENTS.md](AGENTS.md) — Coding conventions & boundary definitions
+- [docs/mev-concepts-glossary.md](docs/mev-concepts-glossary.md) — MEV terminology
+- [docs/tutorial-1-first-backtest.md](docs/tutorial-1-first-backtest.md) — First backtest walkthrough
+- [docs/tutorial-2-arb-math.md](docs/tutorial-2-arb-math.md) — Arbitrage math deep dive
+- [docs/MATH.md](docs/MATH.md) — Optimal input derivation
+- [docs/VALIDATION.md](docs/VALIDATION.md) — Validation methodology
 
 ---
 
