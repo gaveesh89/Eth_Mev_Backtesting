@@ -18,7 +18,7 @@ alloy = "0.12"
 revm = "19"
 arrow = "53"
 parquet = "53"
-rusqlite = "0.32"
+rusqlite = "0.38"
 tokio = { version = "1", features = ["fs", "io-util", "rt"] }
 clap = "4"
 serde = "=1.0.217"
