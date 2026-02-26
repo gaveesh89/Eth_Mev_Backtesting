@@ -11,7 +11,7 @@ use mev_data::store::{IntraBlockArbRow, Store};
 use mev_sim::decoder::addresses;
 use mev_sim::ordering::{order_by_egp, order_by_profit};
 use mev_sim::strategies::arbitrage::{scan_for_arb, DEFAULT_ARB_PAIRS};
-use mev_sim::strategies::cex_dex_arb::{cex_price_f64_to_fp, scan_cex_dex, CexPricePoint};
+use mev_sim::strategies::cex_dex_arb::{micro_usd_to_cex_price_fp, scan_cex_dex, CexPricePoint};
 use mev_sim::strategies::dex_dex_intra::scan_default_dex_dex_intra_block;
 use mev_sim::EvmFork;
 use std::path::{Path, PathBuf};
@@ -200,7 +200,8 @@ async fn handle_ingest_cex(ctx: &AppContext, args: IngestCexArgs) -> Result<()> 
     }
 
     let store = Store::new(&ctx.db_path).wrap_err("failed to open SQLite store")?;
-    let mut rows = Vec::<(u64, f64, f64, f64, f64)>::new();
+    let mut rows = Vec::<(&str, u64, i64, i64, i64, i64)>::new();
+    let pair = "ETHUSDC";
 
     for path in &args.csv {
         let content = std::fs::read_to_string(path)
@@ -227,24 +228,26 @@ async fn handle_ingest_cex(ctx: &AppContext, args: IngestCexArgs) -> Result<()> 
                 Err(_) => continue,
             };
 
+            // Convert f64 prices to micro-USD (price × 1e6) at the intake boundary.
+            // This is the only place f64 prices are touched; after this everything is integer.
             let open = match parts[1].parse::<f64>() {
-                Ok(value) => value,
+                Ok(value) => (value * 1_000_000.0) as i64,
                 Err(_) => continue,
             };
             let high = match parts[2].parse::<f64>() {
-                Ok(value) => value,
+                Ok(value) => (value * 1_000_000.0) as i64,
                 Err(_) => continue,
             };
             let low = match parts[3].parse::<f64>() {
-                Ok(value) => value,
+                Ok(value) => (value * 1_000_000.0) as i64,
                 Err(_) => continue,
             };
             let close = match parts[4].parse::<f64>() {
-                Ok(value) => value,
+                Ok(value) => (value * 1_000_000.0) as i64,
                 Err(_) => continue,
             };
 
-            rows.push((open_time_ms / 1000, open, close, high, low));
+            rows.push((pair, open_time_ms / 1000, open, close, high, low));
         }
     }
 
@@ -380,12 +383,12 @@ async fn handle_simulate(ctx: &AppContext, args: SimulateArgs) -> Result<()> {
                     .ok_or_else(|| eyre!("MEV_RPC_URL is required for cex_dex strategy"))?;
                 let cex_price_point =
                     match store
-                        .get_nearest_cex_close_price_point(block.timestamp)
+                        .get_nearest_cex_close_price_micro("ETHUSDC", block.timestamp)
                         .wrap_err("failed to query cex close price point")?
                     {
-                        Some((timestamp_s, close)) => {
-                            let close_price_fp = cex_price_f64_to_fp(close)
-                                .wrap_err("failed to convert cex close to fixed-point")?;
+                        Some((timestamp_s, close_micro)) => {
+                            let close_price_fp =
+                                micro_usd_to_cex_price_fp(close_micro);
                             Some(CexPricePoint {
                                 timestamp_s,
                                 close_price_fp,

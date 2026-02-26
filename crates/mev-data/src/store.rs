@@ -102,11 +102,13 @@ impl Store {
             );
 
             CREATE TABLE IF NOT EXISTS cex_prices (
-                timestamp_s INTEGER PRIMARY KEY,
-                open REAL NOT NULL,
-                close REAL NOT NULL,
-                high REAL NOT NULL,
-                low REAL NOT NULL
+                pair TEXT NOT NULL,
+                timestamp_s INTEGER NOT NULL,
+                open_micro INTEGER NOT NULL,
+                close_micro INTEGER NOT NULL,
+                high_micro INTEGER NOT NULL,
+                low_micro INTEGER NOT NULL,
+                PRIMARY KEY (pair, timestamp_s)
             );
 
             CREATE TABLE IF NOT EXISTS intra_block_arbs (
@@ -126,27 +128,36 @@ impl Store {
         Ok(())
     }
 
-    /// Inserts Binance-derived CEX prices keyed by second timestamp.
+    /// Inserts Binance-derived CEX prices keyed by pair + second timestamp.
     ///
-    /// Existing rows are replaced for the same timestamp.
+    /// Prices are stored as integers in micro-USD (price × 1e6).
+    /// Existing rows are replaced for the same (pair, timestamp).
+    ///
+    /// Each row: `(pair, timestamp_s, open_micro, close_micro, high_micro, low_micro)`.
     ///
     /// # Errors
     /// Returns error if any database operation fails.
-    pub fn insert_cex_prices(&self, rows: &[(u64, f64, f64, f64, f64)]) -> Result<usize> {
+    pub fn insert_cex_prices(&self, rows: &[(&str, u64, i64, i64, i64, i64)]) -> Result<usize> {
         let mut conn = self.conn.borrow_mut();
         let tx = conn.transaction()?;
         let mut inserted = 0usize;
         {
             let mut stmt = tx.prepare(
                 "
-                INSERT OR REPLACE INTO cex_prices (timestamp_s, open, close, high, low)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT OR REPLACE INTO cex_prices (pair, timestamp_s, open_micro, close_micro, high_micro, low_micro)
+                VALUES (?, ?, ?, ?, ?, ?)
                 ",
             )?;
 
             for row in rows {
-                let affected =
-                    stmt.execute(rusqlite::params![row.0 as i64, row.1, row.2, row.3, row.4,])?;
+                let affected = stmt.execute(rusqlite::params![
+                    row.0,
+                    row.1 as i64,
+                    row.2,
+                    row.3,
+                    row.4,
+                    row.5,
+                ])?;
                 inserted = inserted.saturating_add(affected);
             }
         }
@@ -155,37 +166,30 @@ impl Store {
         Ok(inserted)
     }
 
-    /// Returns nearest CEX close price (by absolute second distance) for a block timestamp.
+    /// Returns nearest CEX close price in micro-USD for a given pair and block timestamp.
     ///
     /// # Errors
     /// Returns error if database query fails.
-    pub fn get_nearest_cex_close_price(&self, timestamp_s: u64) -> Result<Option<f64>> {
-        let result = self.get_nearest_cex_close_price_point(timestamp_s)?;
-        Ok(result.map(|(_, close)| close))
-    }
-
-    /// Returns nearest CEX close price point (timestamp and close) for a target block timestamp.
-    ///
-    /// # Errors
-    /// Returns error if database query fails.
-    pub fn get_nearest_cex_close_price_point(
+    pub fn get_nearest_cex_close_price_micro(
         &self,
+        pair: &str,
         timestamp_s: u64,
-    ) -> Result<Option<(u64, f64)>> {
+    ) -> Result<Option<(u64, i64)>> {
         let conn = self.conn.borrow();
         let mut stmt = conn.prepare(
             "
-            SELECT timestamp_s, close
+            SELECT timestamp_s, close_micro
             FROM cex_prices
+            WHERE pair = ?
             ORDER BY ABS(timestamp_s - ?) ASC
             LIMIT 1
             ",
         )?;
 
-        let result = stmt.query_row(rusqlite::params![timestamp_s as i64], |row| {
+        let result = stmt.query_row(rusqlite::params![pair, timestamp_s as i64], |row| {
             let candle_timestamp: i64 = row.get(0)?;
-            let close: f64 = row.get(1)?;
-            Ok((candle_timestamp as u64, close))
+            let close_micro: i64 = row.get(1)?;
+            Ok((candle_timestamp as u64, close_micro))
         });
 
         match result {
