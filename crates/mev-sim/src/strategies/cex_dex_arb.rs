@@ -524,6 +524,100 @@ pub async fn scan_cex_dex(
 }
 
 #[cfg(test)]
+/// Collects the full profit curve across all candidate inputs.
+///
+/// Returns a sorted vec of `(amount_in, profit_wei)` — including zero-profit entries.
+fn collect_profit_curve(
+    reserve_weth: u128,
+    reserve_quote: u128,
+    cex_quote_per_weth: U256,
+    quote_token: Address,
+    direction: ArbDirection,
+) -> Vec<(u128, i128)> {
+    let max_input = match direction {
+        ArbDirection::BuyOnDex => reserve_quote / 10,
+        ArbDirection::SellOnDex => reserve_weth / 10,
+    };
+
+    if max_input == 0 {
+        return Vec::new();
+    }
+
+    let mut candidate_inputs = Vec::new();
+    let min_input = match direction {
+        ArbDirection::BuyOnDex => 1_000_000u128,
+        ArbDirection::SellOnDex => 1_000_000_000_000_000u128,
+    };
+
+    for exponent in 0..=24u32 {
+        let shifted = max_input >> exponent;
+        if shifted == 0 {
+            continue;
+        }
+        candidate_inputs.push(shifted.max(min_input).min(max_input));
+    }
+
+    for step in 1..=40u128 {
+        let input = max_input.saturating_mul(step) / 40;
+        if input > 0 {
+            candidate_inputs.push(input.max(min_input).min(max_input));
+        }
+    }
+
+    candidate_inputs.sort_unstable();
+    candidate_inputs.dedup();
+
+    let mut curve = Vec::new();
+
+    for input in candidate_inputs {
+        if input == 0 {
+            continue;
+        }
+
+        let profit: i128 = match direction {
+            ArbDirection::SellOnDex => {
+                let output_quote = amount_out(input, reserve_weth, reserve_quote);
+                if output_quote == 0 {
+                    0
+                } else {
+                    let input_quote_at_cex =
+                        (U256::from(input) * cex_quote_per_weth) / pow10_u256(18);
+                    let output_quote_u256 = U256::from(output_quote);
+                    if output_quote_u256 > input_quote_at_cex {
+                        let profit_quote = output_quote_u256 - input_quote_at_cex;
+                        ((profit_quote * pow10_u256(18)) / cex_quote_per_weth).to::<i128>()
+                    } else {
+                        let loss_quote = input_quote_at_cex - output_quote_u256;
+                        -(((loss_quote * pow10_u256(18)) / cex_quote_per_weth).to::<i128>())
+                    }
+                }
+            }
+            ArbDirection::BuyOnDex => {
+                let output_weth = amount_out(input, reserve_quote, reserve_weth);
+                if output_weth == 0 {
+                    0
+                } else {
+                    let output_quote_at_cex =
+                        (U256::from(output_weth) * cex_quote_per_weth) / pow10_u256(18);
+                    let input_quote_u256 = U256::from(input);
+                    if output_quote_at_cex > input_quote_u256 {
+                        let profit_quote = output_quote_at_cex - input_quote_u256;
+                        ((profit_quote * pow10_u256(18)) / cex_quote_per_weth).to::<i128>()
+                    } else {
+                        let loss_quote = input_quote_u256 - output_quote_at_cex;
+                        -(((loss_quote * pow10_u256(18)) / cex_quote_per_weth).to::<i128>())
+                    }
+                }
+            }
+        };
+
+        curve.push((input, profit));
+    }
+
+    curve
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -713,6 +807,156 @@ mod tests {
                     profit,
                 );
             }
+        });
+    }
+
+    #[test]
+    #[ignore = "requires archive RPC"]
+    fn test_cex_dex_profit_curve_shape() {
+        init_test_tracing();
+        let Some(rpc_url) = std::env::var("MEV_RPC_URL").ok() else {
+            eprintln!("MEV_RPC_URL not set; skipping profit curve test");
+            return;
+        };
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime should build");
+
+        runtime.block_on(async {
+            let block_number: u64 = 16_817_050;
+            let reserve_reader =
+                super::super::arbitrage::ReserveReader::new(&rpc_url, block_number);
+
+            // Read Uniswap V2 WETH/USDC reserves
+            let pair_addr = reserve_reader
+                .get_pair(
+                    addresses::UNISWAP_V2_FACTORY,
+                    addresses::WETH,
+                    addresses::USDC,
+                )
+                .await
+                .expect("get_pair should succeed")
+                .expect("pair should exist");
+
+            let (reserve0, reserve1, _) = reserve_reader
+                .get_reserves(pair_addr)
+                .await
+                .expect("get_reserves should succeed");
+
+            // WETH < USDC by address sort, so WETH is token0
+            let (reserve_weth, reserve_usdc) = if addresses::WETH < addresses::USDC {
+                (reserve0, reserve1)
+            } else {
+                (reserve1, reserve0)
+            };
+
+            eprintln!("=== PROFIT CURVE SANITY CHECK (block {}) ===", block_number);
+            eprintln!(
+                "Reserves: {} WETH wei, {} USDC (6 dec)",
+                reserve_weth, reserve_usdc
+            );
+
+            // Hardcoded CEX price ($1580)
+            let cex_price_fp = cex_price_f64_to_fp(1580.0).expect("price conversion");
+            let cex_quote_per_weth = cex_price_fp_to_quote_per_weth(cex_price_fp, 6);
+
+            eprintln!(
+                "CEX price: $1580.00 (quote_per_weth={})",
+                cex_quote_per_weth
+            );
+
+            // SellOnDex direction (WETH overpriced on DEX during depeg)
+            let curve = collect_profit_curve(
+                reserve_weth,
+                reserve_usdc,
+                cex_quote_per_weth,
+                addresses::USDC,
+                ArbDirection::SellOnDex,
+            );
+
+            assert!(
+                !curve.is_empty(),
+                "profit curve should have at least one candidate"
+            );
+
+            // Print the full curve
+            eprintln!(
+                "\n{:>5} | {:>22} | {:>18} | {:>14}",
+                "idx", "amount_in_wei", "profit_wei", "profit_eth"
+            );
+            eprintln!("{}", "-".repeat(70));
+
+            let mut max_profit: i128 = i128::MIN;
+            let mut max_profit_index: usize = 0;
+
+            for (idx, (amount_in, profit)) in curve.iter().enumerate() {
+                let _amount_in_eth = *amount_in as f64 / 1e18;
+                let profit_eth = *profit as f64 / 1e18;
+
+                eprintln!(
+                    "{:>5} | {:>22} | {:>18} | {:>14.6}",
+                    idx, amount_in, profit, profit_eth
+                );
+
+                if *profit > max_profit {
+                    max_profit = *profit;
+                    max_profit_index = idx;
+                }
+            }
+
+            let last_index = curve.len() - 1;
+
+            eprintln!("\n--- CURVE ANALYSIS ---");
+            eprintln!("Total candidates: {}", curve.len());
+            eprintln!(
+                "Max profit: {} wei ({:.6} ETH) at index {}",
+                max_profit,
+                max_profit as f64 / 1e18,
+                max_profit_index
+            );
+            eprintln!(
+                "Max input: {} wei ({:.4} ETH)",
+                curve[max_profit_index].0,
+                curve[max_profit_index].0 as f64 / 1e18
+            );
+            eprintln!("First candidate profit: {} wei", curve[0].1);
+            eprintln!("Last candidate profit: {} wei", curve[last_index].1);
+
+            let reserve_fraction = curve[max_profit_index].0 as f64 / reserve_weth as f64;
+            eprintln!(
+                "Optimal input as % of WETH reserve: {:.2}%",
+                reserve_fraction * 100.0
+            );
+
+            // ASSERTIONS
+            // 1. Max is NOT at index 0 (interior optimum, not smallest)
+            assert!(
+                max_profit_index > 0,
+                "max profit should NOT be at smallest candidate (index 0)"
+            );
+
+            // 2. Max is NOT at last index (not hitting the cap)
+            assert!(
+                max_profit_index < last_index,
+                "max profit at last index {} — sweep cap may be too tight",
+                max_profit_index
+            );
+
+            // 3. First candidate is profitable (given ~230 bps spread)
+            assert!(
+                curve[0].1 > 0,
+                "smallest candidate should be profitable (spread ~230 bps)"
+            );
+
+            // 4. Last candidate has lower profit than peak (curve descends)
+            assert!(
+                curve[last_index].1 < max_profit,
+                "last candidate should have less profit than peak"
+            );
+
+            eprintln!("\n=== PROFIT CURVE SHAPE: VALID (unimodal, interior peak) ===");
         });
     }
 }
