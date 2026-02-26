@@ -14,7 +14,10 @@
       "Sushi_WETH_USDT [token1->token0] a0in=0 a1in=15997805674 a0out=9966832767477638952 a1out=0",
       "UniV2_WETH_USDT [token1->token0] a0in=0 a1in=35995062767 a0out=22418827461054014358 a1out=0",
       "Sushi_WETH_USDC [token0->token1] a0in=16000000000 a1in=0 a0out=0 a1out=9957786989853297917"
-    ]
+    ],
+    "verified_gross_profit_wei": "0",
+    "verified_net_profit_wei": "-184835279519590790",
+    "verified_gas_cost_wei": "184835279519590790"
   },
   {
     "block_number": 15537582,
@@ -31,7 +34,10 @@
       "Sushi_WETH_USDT [token1->token0] a0in=0 a1in=19996965281 a0out=12133568880803231990 a1out=0",
       "UniV2_WETH_USDT [token1->token0] a0in=0 a1in=23996358338 a0out=14556785710193292014 a1out=0",
       "Sushi_WETH_USDC [token0->token1] a0in=20000000000 a1in=0 a0out=0 a1out=12147174947079973172"
-    ]
+    ],
+    "verified_gross_profit_wei": "0",
+    "verified_net_profit_wei": "-80122251867610680",
+    "verified_gas_cost_wei": "80122251867610680"
   },
   {
     "block_number": 15537616,
@@ -47,7 +53,10 @@
     "swap_details": [
       "Sushi_WETH_USDT [token1->token0] a0in=0 a1in=10586658642 a0out=6434086368785073340 a1out=0",
       "UniV2_WETH_USDT [token1->token0] a0in=0 a1in=19063115196 a0out=11588496744085041712 a1out=0"
-    ]
+    ],
+    "verified_gross_profit_wei": "86501934700924436",
+    "verified_net_profit_wei": "40926730536472164",
+    "verified_gas_cost_wei": "45575204164452272"
   },
   {
     "block_number": 15537913,
@@ -63,7 +72,10 @@
     "swap_details": [
       "UniV2_WETH_USDC [token1->token0] a0in=0 a1in=7692307692307692539 a0out=12331996374 a1out=0",
       "Sushi_WETH_USDC [token1->token0] a0in=0 a1in=7692307692307692539 a0out=12329249322 a1out=0"
-    ]
+    ],
+    "verified_gross_profit_wei": "0",
+    "verified_net_profit_wei": "-18300617527772760",
+    "verified_gas_cost_wei": "18300617527772760"
   },
   {
     "block_number": 15538813,
@@ -81,7 +93,10 @@
       "Sushi_WETH_USDC [token0->token1] a0in=9997218024 a1in=0 a0out=0 a1out=6269904255581926608",
       "UniV2_WETH_DAI [token0->token1] a0in=5997879922023000000000 a1in=0 a0out=0 a1out=3760716588418741343",
       "Sushi_WETH_DAI [token0->token1] a0in=1000546425636000000000 a1in=0 a0out=0 a1out=627762608262153640"
-    ]
+    ],
+    "verified_gross_profit_wei": "31351601567370040836",
+    "verified_net_profit_wei": "31342304379289101422",
+    "verified_gas_cost_wei": "9297188080939414"
   },
   {
     "block_number": 15538813,
@@ -99,7 +114,10 @@
       "Sushi_WETH_USDC [token0->token1] a0in=9997218024 a1in=0 a0out=0 a1out=6269904255581926608",
       "UniV2_WETH_DAI [token0->token1] a0in=5997879922023000000000 a1in=0 a0out=0 a1out=3760716588418741343",
       "Sushi_WETH_DAI [token0->token1] a0in=1000546425636000000000 a1in=0 a0out=0 a1out=627762608262153640"
-    ]
+    ],
+    "verified_gross_profit_wei": "31351601567370040836",
+    "verified_net_profit_wei": "31342304379289101422",
+    "verified_gas_cost_wei": "9297188080939414"
   },
   {
     "block_number": 15539280,
@@ -115,6 +133,9 @@
     "swap_details": [
       "UniV2_WETH_USDC [token0->token1] a0in=263805731 a1in=0 a0out=0 a1out=165386424212170940",
       "Sushi_WETH_USDC [token0->token1] a0in=338176521 a1in=0 a0out=0 a1out=211897944405325140"
-    ]
+    ],
+    "verified_gross_profit_wei": "0",
+    "verified_net_profit_wei": "-3848760024962787",
+    "verified_gas_cost_wei": "3848760024962787"
   }
 ]

@@ -15,7 +15,7 @@
 //! ETHERSCAN_API_KEY=xxx cargo test -p mev-sim verify_fixtures_on_etherscan -- --ignored --nocapture
 //! ```
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -23,6 +23,12 @@ use serde::{Deserialize, Serialize};
 
 /// Uniswap V2 / SushiSwap `Swap` event topic0.
 const SWAP_TOPIC: &str = "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822";
+
+/// ERC-20 `Transfer(address,address,uint256)` event topic0.
+const TRANSFER_TOPIC: &str = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+
+/// WETH contract address (lowercase, with 0x prefix).
+const WETH_ADDRESS: &str = "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2";
 
 /// Tracked pool addresses (lowercase, with 0x prefix).
 const TRACKED_POOLS: &[(&str, &str)] = &[
@@ -52,25 +58,6 @@ const TRACKED_POOLS: &[(&str, &str)] = &[
     ),
 ];
 
-/// Pairs of tracked pools that form arbitrage pairs (pool_a / pool_b).
-const ARB_PAIRS: &[(&str, &str, &str)] = &[
-    (
-        "0xb4e16d0168e52d35cacd2c6185b44281ec28c9dc",
-        "0x397ff1542f962076d0bfe58ea045ffa2d347aca0",
-        "WETH/USDC (UniV2<>Sushi)",
-    ),
-    (
-        "0xa478c2975ab1ea89e8196811f51a7b7ade33eb11",
-        "0xc3d03e4f041fd4cd388c549ee2a29a9e5075882f",
-        "WETH/DAI (UniV2<>Sushi)",
-    ),
-    (
-        "0x0d4a11d5eeaac28ec3f61d100daf4d40471f1852",
-        "0x06da0fd433c1a5d7a4faa01111c044910a184553",
-        "WETH/USDT (UniV2<>Sushi)",
-    ),
-];
-
 /// Fixture entry as stored in `known_arb_txs.json`.
 ///
 /// Fields are a superset: the original fields plus optional verification metadata
@@ -96,6 +83,14 @@ struct KnownArbTx {
     actual_arb_tx_count: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     swap_details: Option<Vec<String>>,
+
+    // --- profit verification (added by profit verification pass) ---
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verified_gross_profit_wei: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verified_net_profit_wei: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verified_gas_cost_wei: Option<String>,
 }
 
 /// Etherscan API response for getLogs / proxy calls.
@@ -163,6 +158,138 @@ fn decode_swap_data(data_hex: &str) -> Option<(u128, u128, u128, u128)> {
         parse_chunk(128)?,
         parse_chunk(192)?,
     ))
+}
+
+/// Decode a 32-byte (64 hex char) `uint256` value from a Transfer event's `data` field.
+///
+/// Returns `None` if the hex is too long (>32 hex chars after stripping) to fit u128,
+/// or if parsing fails.
+fn decode_transfer_amount(data_hex: &str) -> Option<u128> {
+    let hex = data_hex.strip_prefix("0x").unwrap_or(data_hex);
+    let trimmed = hex.trim_start_matches('0');
+    let trimmed = if trimmed.is_empty() { "0" } else { trimmed };
+    // Guard: u128 holds 32 hex chars max — ERC-20 amounts should fit
+    if trimmed.len() > 32 {
+        return None;
+    }
+    u128::from_str_radix(trimmed, 16).ok()
+}
+
+/// Extract a 20-byte address from a 32-byte indexed topic (left-zero-padded).
+///
+/// E.g. `"0x000000000000000000000000c02aaa39b223fe8d0a0e5c4f27ead9083c756cc2"`
+/// → `"0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2"`
+fn address_from_topic(topic: &str) -> Option<String> {
+    let hex = topic.strip_prefix("0x").unwrap_or(topic);
+    if hex.len() < 40 {
+        return None;
+    }
+    let addr = &hex[hex.len() - 40..];
+    Some(format!("0x{}", addr.to_lowercase()))
+}
+
+/// Parse a `0x`-prefixed hex string into u128 (for gasUsed, effectiveGasPrice, etc.).
+fn parse_hex_u128(value: &str) -> Option<u128> {
+    let hex = value.strip_prefix("0x").unwrap_or(value);
+    let trimmed = hex.trim_start_matches('0');
+    let trimmed = if trimmed.is_empty() { "0" } else { trimmed };
+    u128::from_str_radix(trimmed, 16).ok()
+}
+
+/// Balance-delta map: `address → (token_address → signed_balance_change)`.
+///
+/// Positive values = net inflow, negative = net outflow.
+type BalanceDeltaMap = HashMap<String, HashMap<String, i128>>;
+
+/// Build balance deltas from ALL Transfer logs in a receipt.
+///
+/// For each `Transfer(from, to, amount)`:
+///   `delta[to][token]   += amount`
+///   `delta[from][token] -= amount`
+fn build_balance_deltas(logs: &[serde_json::Value]) -> BalanceDeltaMap {
+    let mut deltas: BalanceDeltaMap = HashMap::new();
+
+    for log in logs {
+        let topics: Vec<String> = log
+            .get("topics")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|t| t.as_str().map(|s| s.to_lowercase()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Must be Transfer with 3 indexed topics: topic0, from, to
+        if topics.len() < 3 || topics[0] != TRANSFER_TOPIC {
+            continue;
+        }
+
+        let token_address = log
+            .get("address")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_lowercase())
+            .unwrap_or_default();
+
+        let from = match address_from_topic(&topics[1]) {
+            Some(a) => a,
+            None => continue,
+        };
+        let to = match address_from_topic(&topics[2]) {
+            Some(a) => a,
+            None => continue,
+        };
+
+        let data_hex = log.get("data").and_then(|v| v.as_str()).unwrap_or("0x0");
+        let amount = match decode_transfer_amount(data_hex) {
+            Some(a) => a as i128,
+            None => continue,
+        };
+
+        // from loses tokens
+        *deltas
+            .entry(from)
+            .or_default()
+            .entry(token_address.clone())
+            .or_insert(0) -= amount;
+
+        // to gains tokens
+        *deltas
+            .entry(to)
+            .or_default()
+            .entry(token_address)
+            .or_insert(0) += amount;
+    }
+
+    deltas
+}
+
+/// Fetch a transaction receipt from Etherscan's `eth_getTransactionReceipt` proxy.
+async fn fetch_receipt(
+    client: &reqwest::Client,
+    api_key: &str,
+    tx_hash: &str,
+) -> Result<serde_json::Value, String> {
+    let url = format!(
+        "https://api.etherscan.io/v2/api?chainid=1&module=proxy&action=eth_getTransactionReceipt\
+         &txhash={}&apikey={}",
+        tx_hash, api_key,
+    );
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("HTTP error: {e}"))?;
+
+    let body: EtherscanResponse = resp
+        .json()
+        .await
+        .map_err(|e| format!("JSON parse error: {e}"))?;
+
+    match body.result {
+        Some(v) if !v.is_null() => Ok(v),
+        _ => Err("null or missing receipt".to_string()),
+    }
 }
 
 /// Resolve fixture file path: `<workspace_root>/test_data/known_arb_txs.json`.
@@ -308,7 +435,7 @@ async fn verify_fixtures_on_etherscan() {
     };
 
     // block_number -> (tx_hash -> Vec<SwapDetail>)
-    let mut block_swaps: BTreeMap<u64, HashMap<String, Vec<SwapDetail>>> = BTreeMap::new();
+    let mut block_swaps: HashMap<u64, HashMap<String, Vec<SwapDetail>>> = HashMap::new();
 
     eprintln!(
         "\n=== Fetching Swap logs for {} unique blocks via Etherscan getLogs ===\n",
@@ -455,54 +582,205 @@ async fn verify_fixtures_on_etherscan() {
         fixture.swap_details = Some(detail_strings);
     }
 
-    // ---- Summary ----
-    eprintln!("\n=== VERIFICATION SUMMARY ===");
-    eprintln!("  Total fixtures:          {}", fixtures.len());
-    eprintln!("  CONFIRMED_CROSS_DEX_ARB: {}", confirmed_count);
-    eprintln!("  OPPORTUNITY_CONFIRMED/ONLY: {}", opportunity_only_count);
+    // ---- Phase 3: Profit verification via tx receipts ----
+    // For each CONFIRMED fixture, fetch the receipt, decode Transfer events,
+    // build balance deltas, and extract the arbitrageur's WETH P&L.
+    let confirmed_fixtures: Vec<usize> = fixtures
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| f.verification_status.as_deref() == Some("CONFIRMED_CROSS_DEX_ARB"))
+        .map(|(i, _)| i)
+        .collect();
 
-    // Also print block-level summary of ALL cross-DEX arbs found
-    eprintln!("\n=== BLOCK-LEVEL CROSS-DEX ARB SCAN ===");
-    for (block, swaps) in &block_swaps {
-        for (pool_a, pool_b, pair_name) in ARB_PAIRS {
-            let cross_txs: Vec<&String> = swaps
-                .keys()
-                .filter(|tx_hash| {
-                    let details = &swaps[*tx_hash];
-                    let pools: HashSet<&str> =
-                        details.iter().map(|d| d.pool_address.as_str()).collect();
-                    pools.contains(*pool_a) && pools.contains(*pool_b)
-                })
-                .collect();
+    eprintln!(
+        "\n=== PROFIT VERIFICATION ({} confirmed fixtures) ===\n",
+        confirmed_fixtures.len()
+    );
+    eprintln!(
+        "{:<12} | {:<8} | {:<22} | {:<22} | {:<22} | profit_check",
+        "tx_hash", "block", "gross_profit_wei", "gas_cost_wei", "net_profit_wei"
+    );
+    eprintln!("{}", "-".repeat(120));
 
-            if !cross_txs.is_empty() {
-                eprintln!(
-                    "  Block {} | {} | {} cross-DEX arb tx(s):",
-                    block,
-                    pair_name,
-                    cross_txs.len(),
-                );
-                for tx in &cross_txs {
-                    eprintln!("    {}", tx);
-                    if let Some(details) = swaps.get(*tx) {
-                        for d in details {
-                            eprintln!("      {}", d);
-                        }
+    let mut profit_match_count: usize = 0;
+    let mut profit_mismatch_count: usize = 0;
+    let mut profit_error_count: usize = 0;
+
+    // deduplicate tx_hash — block 15538813 has two fixture entries for the same tx
+    let mut seen_tx_hashes: HashSet<String> = HashSet::new();
+    // Cache receipts by tx_hash so we don't fetch the same receipt twice
+    let mut receipt_cache: HashMap<String, serde_json::Value> = HashMap::new();
+
+    for &idx in &confirmed_fixtures {
+        let fixture = &fixtures[idx];
+        let arb_tx_hash = fixture
+            .actual_arb_tx_hash
+            .as_deref()
+            .unwrap_or(&fixture.tx_hash)
+            .to_lowercase();
+
+        // Rate limit (free tier: 5 calls/sec)
+        tokio::time::sleep(Duration::from_millis(220)).await;
+
+        // Fetch receipt if not cached
+        if !receipt_cache.contains_key(&arb_tx_hash) {
+            match fetch_receipt(&client, &api_key, &arb_tx_hash).await {
+                Ok(r) => {
+                    receipt_cache.insert(arb_tx_hash.clone(), r);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "{:<12} | {:<8} | ERROR: {}",
+                        &arb_tx_hash[..12],
+                        fixture.block_number,
+                        e
+                    );
+                    profit_error_count += 1;
+                    continue;
+                }
+            }
+        }
+
+        let receipt = &receipt_cache[&arb_tx_hash];
+
+        // 1. Extract all logs from the receipt
+        let logs = receipt
+            .get("logs")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        // 2. Build balance delta map from Transfer events
+        let deltas = build_balance_deltas(&logs);
+
+        // 3. Identify the tx sender (EOA) and the arb contract (receipt.to).
+        //    MEV arbs typically go through a contract — profit lands in the
+        //    contract, not the EOA.  We check BOTH and pick the one with
+        //    the higher WETH balance delta.
+        let tx_sender = receipt
+            .get("from")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_lowercase())
+            .unwrap_or_default();
+
+        let arb_contract = receipt
+            .get("to")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_lowercase())
+            .unwrap_or_default();
+
+        let sender_weth_delta: i128 = deltas
+            .get(&tx_sender)
+            .and_then(|m| m.get(WETH_ADDRESS))
+            .copied()
+            .unwrap_or(0);
+
+        let contract_weth_delta: i128 = deltas
+            .get(&arb_contract)
+            .and_then(|m| m.get(WETH_ADDRESS))
+            .copied()
+            .unwrap_or(0);
+
+        // 4. Gross profit = best WETH delta between EOA and contract
+        let (gross_profit_wei, profiteer) = if contract_weth_delta > sender_weth_delta {
+            (
+                contract_weth_delta,
+                format!("contract({}…)", &arb_contract[..10]),
+            )
+        } else {
+            (sender_weth_delta, format!("sender({}…)", &tx_sender[..10]))
+        };
+
+        // 5. Gas cost = gasUsed * effectiveGasPrice
+        let gas_used = receipt
+            .get("gasUsed")
+            .and_then(|v| v.as_str())
+            .and_then(parse_hex_u128)
+            .unwrap_or(0);
+        let effective_gas_price = receipt
+            .get("effectiveGasPrice")
+            .and_then(|v| v.as_str())
+            .and_then(parse_hex_u128)
+            .unwrap_or(0);
+        let gas_cost_wei: u128 = gas_used.saturating_mul(effective_gas_price);
+
+        // 6. Net profit = gross - gas (i128 to handle negatives)
+        let net_profit_wei: i128 = gross_profit_wei - gas_cost_wei as i128;
+
+        // 7. Compare against fixture's expected profit
+        let expected = fixture.profit_approx_wei as i128;
+        let profit_check = if expected == 0 && gross_profit_wei == 0 {
+            profit_match_count += 1;
+            "MATCH (both zero)".to_string()
+        } else if expected == 0 {
+            // Expected was a placeholder — just report the verified value
+            profit_match_count += 1;
+            format!("NEW (gross={})", gross_profit_wei)
+        } else {
+            let deviation_pct = if expected != 0 {
+                ((gross_profit_wei - expected) as f64 / expected as f64 * 100.0).abs()
+            } else {
+                100.0
+            };
+            if deviation_pct <= 10.0 {
+                profit_match_count += 1;
+                format!("MATCH ({:.1}% dev)", deviation_pct)
+            } else {
+                profit_mismatch_count += 1;
+                format!(
+                    "WARNING: {:.1}% deviation (expected={}, verified={})",
+                    deviation_pct, expected, gross_profit_wei
+                )
+            }
+        };
+
+        let short_hash = format!("{}…", &arb_tx_hash[..10]);
+        eprintln!(
+            "{:<12} | {:<8} | {:<22} | {:<22} | {:<22} | {}",
+            short_hash,
+            fixture.block_number,
+            gross_profit_wei,
+            gas_cost_wei,
+            net_profit_wei,
+            profit_check,
+        );
+        eprintln!("             profiteer: {}", profiteer);
+
+        // Log non-WETH token deltas for the sender and contract (diagnostics)
+        for addr_label in &[(&tx_sender, "sender"), (&arb_contract, "contract")] {
+            if let Some(token_map) = deltas.get(addr_label.0) {
+                for (token, delta) in token_map {
+                    if token != WETH_ADDRESS && *delta != 0 {
+                        eprintln!(
+                            "             {}_DELTA: {}…  {}",
+                            addr_label.1,
+                            &token[..10],
+                            delta,
+                        );
                     }
                 }
             }
         }
 
-        // Show summary of all swap activity
-        let total_swap_txs = swaps.len();
-        let total_swap_events: usize = swaps.values().map(|v| v.len()).sum();
-        eprintln!(
-            "  Block {} — total: {} swap txs, {} swap events on tracked pools",
-            block, total_swap_txs, total_swap_events,
-        );
+        // Skip duplicate enrichment for same tx_hash (block 15538813 two entries)
+        if seen_tx_hashes.contains(&arb_tx_hash) {
+            // Still enrich the fixture entry
+            let f = &mut fixtures[idx];
+            f.verified_gross_profit_wei = Some(gross_profit_wei.to_string());
+            f.verified_net_profit_wei = Some(net_profit_wei.to_string());
+            f.verified_gas_cost_wei = Some(gas_cost_wei.to_string());
+            continue;
+        }
+        seen_tx_hashes.insert(arb_tx_hash.clone());
+
+        // Enrich fixture
+        let f = &mut fixtures[idx];
+        f.verified_gross_profit_wei = Some(gross_profit_wei.to_string());
+        f.verified_net_profit_wei = Some(net_profit_wei.to_string());
+        f.verified_gas_cost_wei = Some(gas_cost_wei.to_string());
     }
 
-    // Write enriched JSON back
+    // ---- Write enriched JSON back ----
     let enriched_json =
         serde_json::to_string_pretty(&fixtures).expect("fixture serialization should succeed");
     std::fs::write(&path, format!("{}\n", enriched_json))
@@ -512,23 +790,38 @@ async fn verify_fixtures_on_etherscan() {
         path.canonicalize().unwrap_or(path.clone()).display()
     );
 
-    // Soft assertion: log a clear result
-    let all_verified = confirmed_count + opportunity_only_count;
-    eprintln!(
-        "\n  Verified: {}/{} fixtures ({} confirmed cross-DEX, {} opportunity-level)",
-        all_verified,
-        fixtures.len(),
-        confirmed_count,
-        opportunity_only_count,
-    );
+    // ---- Final summary ----
+    eprintln!("\n=== VERIFICATION SUMMARY ===");
+    eprintln!("  Total fixtures:          {}", fixtures.len());
+    eprintln!("  CONFIRMED_CROSS_DEX_ARB: {}", confirmed_count);
+    eprintln!("  OPPORTUNITY_CONFIRMED/ONLY: {}", opportunity_only_count);
+    eprintln!();
+    eprintln!("=== PROFIT VERIFICATION ===");
+    eprintln!("  Profit verified (match): {}", profit_match_count);
+    eprintln!("  Profit deviation (>10%): {}", profit_mismatch_count);
+    eprintln!("  Profit fetch errors:     {}", profit_error_count);
 
-    // The fixture detected arb OPPORTUNITIES from pre-block reserves.
-    // Whether someone actually executed a cross-DEX arb tx in the block
-    // depends on MEV searcher activity. We assert that the Etherscan scan
-    // completed without errors and all fixtures got a verification status.
+    // Soft assertion: all fixtures got a verification status
     assert!(
         fixtures.iter().all(|f| f.verification_status.is_some()),
         "All fixtures should have a verification_status after scan",
+    );
+
+    // Assert all confirmed fixtures got profit data
+    let profit_verified = fixtures
+        .iter()
+        .filter(|f| {
+            f.verification_status.as_deref() == Some("CONFIRMED_CROSS_DEX_ARB")
+                && f.verified_gross_profit_wei.is_some()
+        })
+        .count();
+    eprintln!(
+        "  Profit data present:     {}/{} confirmed",
+        profit_verified, confirmed_count
+    );
+    assert_eq!(
+        profit_verified, confirmed_count,
+        "All confirmed fixtures should have verified_gross_profit_wei",
     );
 }
 
@@ -571,5 +864,158 @@ fn fixture_path_points_to_test_data_dir() {
         p.ends_with("test_data/known_arb_txs.json"),
         "expected path ending with test_data/known_arb_txs.json, got: {}",
         p.display()
+    );
+}
+
+#[test]
+fn decode_transfer_amount_parses_one_ether() {
+    let data = format!("0x{:064x}", 1_000_000_000_000_000_000u128);
+    let amount = decode_transfer_amount(&data).expect("should decode");
+    assert_eq!(amount, 1_000_000_000_000_000_000u128);
+}
+
+#[test]
+fn decode_transfer_amount_handles_zero() {
+    let data = format!("0x{:064x}", 0u128);
+    let amount = decode_transfer_amount(&data).expect("should decode zero");
+    assert_eq!(amount, 0);
+}
+
+#[test]
+fn address_from_topic_extracts_correctly() {
+    let topic = "0x000000000000000000000000c02aaa39b223fe8d0a0e5c4f27ead9083c756cc2";
+    let addr = address_from_topic(topic).expect("should extract");
+    assert_eq!(addr, "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2");
+}
+
+#[test]
+fn address_from_topic_rejects_short_input() {
+    assert!(address_from_topic("0xdead").is_none());
+}
+
+#[test]
+fn parse_hex_u128_handles_common_patterns() {
+    assert_eq!(parse_hex_u128("0x0"), Some(0));
+    assert_eq!(parse_hex_u128("0x1"), Some(1));
+    assert_eq!(
+        parse_hex_u128("0xde0b6b3a7640000"),
+        Some(1_000_000_000_000_000_000)
+    );
+    // Leading zeros
+    assert_eq!(
+        parse_hex_u128("0x00000000000000000000000000000001"),
+        Some(1)
+    );
+}
+
+#[test]
+fn build_balance_deltas_tracks_bidirectional_transfers() {
+    // Simulate: alice sends 100 WETH to bob
+    let alice_topic = "0x000000000000000000000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let bob_topic = "0x000000000000000000000000bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let amount_hex = format!("0x{:064x}", 100u128);
+
+    let logs = vec![serde_json::json!({
+        "address": WETH_ADDRESS,
+        "topics": [TRANSFER_TOPIC, alice_topic, bob_topic],
+        "data": amount_hex,
+    })];
+
+    let deltas = build_balance_deltas(&logs);
+    let alice = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let bob = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    assert_eq!(
+        deltas
+            .get(alice)
+            .and_then(|m| m.get(WETH_ADDRESS))
+            .copied()
+            .unwrap_or(0),
+        -100
+    );
+    assert_eq!(
+        deltas
+            .get(bob)
+            .and_then(|m| m.get(WETH_ADDRESS))
+            .copied()
+            .unwrap_or(0),
+        100
+    );
+}
+
+#[test]
+fn build_balance_deltas_aggregates_multiple_transfers() {
+    let alice = "0x000000000000000000000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let bob = "0x000000000000000000000000bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let carol = "0x000000000000000000000000cccccccccccccccccccccccccccccccccccccccc";
+
+    let logs = vec![
+        // bob -> alice: 200 WETH
+        serde_json::json!({
+            "address": WETH_ADDRESS,
+            "topics": [TRANSFER_TOPIC, bob, alice],
+            "data": format!("0x{:064x}", 200u128),
+        }),
+        // alice -> carol: 50 WETH
+        serde_json::json!({
+            "address": WETH_ADDRESS,
+            "topics": [TRANSFER_TOPIC, alice, carol],
+            "data": format!("0x{:064x}", 50u128),
+        }),
+    ];
+
+    let deltas = build_balance_deltas(&logs);
+    let alice_addr = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    // alice: +200 - 50 = +150
+    assert_eq!(
+        deltas
+            .get(alice_addr)
+            .and_then(|m| m.get(WETH_ADDRESS))
+            .copied()
+            .unwrap_or(0),
+        150
+    );
+}
+
+#[test]
+fn build_balance_deltas_tracks_multiple_tokens() {
+    let alice = "0x000000000000000000000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let bob = "0x000000000000000000000000bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let usdc = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48";
+
+    let logs = vec![
+        // WETH: bob -> alice 1 ETH
+        serde_json::json!({
+            "address": WETH_ADDRESS,
+            "topics": [TRANSFER_TOPIC, bob, alice],
+            "data": format!("0x{:064x}", 1_000_000_000_000_000_000u128),
+        }),
+        // USDC: alice -> bob 1500 USDC (6 decimals)
+        serde_json::json!({
+            "address": usdc,
+            "topics": [TRANSFER_TOPIC, alice, bob],
+            "data": format!("0x{:064x}", 1_500_000_000u128),
+        }),
+    ];
+
+    let deltas = build_balance_deltas(&logs);
+    let alice_addr = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    assert_eq!(
+        deltas
+            .get(alice_addr)
+            .and_then(|m| m.get(WETH_ADDRESS))
+            .copied()
+            .unwrap_or(0),
+        1_000_000_000_000_000_000i128
+    );
+    assert_eq!(
+        deltas
+            .get(alice_addr)
+            .and_then(|m| m.get(usdc))
+            .copied()
+            .unwrap_or(0),
+        -1_500_000_000i128
     );
 }
