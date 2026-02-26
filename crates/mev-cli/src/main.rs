@@ -55,6 +55,8 @@ enum Commands {
     Diagnose(DiagnoseArgs),
     /// Classify MEV in a block using SCC transfer-graph analysis.
     Classify(ClassifyArgs),
+    /// Read Uniswap V3 pool price at a historical block.
+    V3Price(V3PriceArgs),
 }
 
 #[derive(Args, Debug)]
@@ -135,6 +137,29 @@ struct ClassifyArgs {
     output: String,
 }
 
+/// Arguments for the `v3-price` subcommand.
+///
+/// Reads Uniswap V3 `slot0()` data and derives the current price at a
+/// historical block. Gated behind `MEV_ENABLE_V3=1`.
+#[derive(Args, Debug)]
+struct V3PriceArgs {
+    /// V3 pool address (hex with 0x prefix).
+    #[arg(long)]
+    pool: String,
+
+    /// Block number to query.
+    #[arg(long)]
+    block: u64,
+
+    /// Token0 decimals (default: 6 for USDC).
+    #[arg(long, default_value = "6")]
+    token0_decimals: u8,
+
+    /// Token1 decimals (default: 18 for WETH).
+    #[arg(long, default_value = "18")]
+    token1_decimals: u8,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     color_eyre::install()?;
@@ -155,6 +180,7 @@ async fn main() -> Result<()> {
         Commands::Status(args) => handle_status(&ctx, args).await,
         Commands::Diagnose(args) => handle_diagnose(&ctx, args).await,
         Commands::Classify(args) => handle_classify(&ctx, args).await,
+        Commands::V3Price(args) => handle_v3_price(&ctx, args).await,
     }
 }
 
@@ -1328,6 +1354,97 @@ async fn handle_classify(ctx: &AppContext, args: ClassifyArgs) -> Result<()> {
         txs_scanned,
         arbs_detected = all_results.len(),
         "classify command completed"
+    );
+
+    Ok(())
+}
+
+/// Handle the `v3-price` subcommand.
+///
+/// Reads Uniswap V3 `slot0()` at a historical block and displays the
+/// decoded price. Uses both `eth_call` and `eth_getStorageAt` methods,
+/// cross-validating `sqrtPriceX96` between the two.
+///
+/// Gated behind `MEV_ENABLE_V3=1` environment variable.
+///
+/// # Errors
+/// Returns error if V3 is not enabled, RPC is unavailable, or decoding fails.
+async fn handle_v3_price(ctx: &AppContext, args: V3PriceArgs) -> Result<()> {
+    mev_sim::v3::require_v3_enabled()?;
+
+    let rpc_url = ctx
+        .rpc_url
+        .as_deref()
+        .ok_or_else(|| eyre!("MEV_RPC_URL is required for v3-price command"))?;
+
+    let pool: alloy::primitives::Address = args
+        .pool
+        .parse()
+        .map_err(|e| eyre!("invalid pool address: {}", e))?;
+
+    // Fetch via eth_call (canonical)
+    let slot0_call = mev_sim::v3::slot0::fetch_slot0_via_call(rpc_url, pool, args.block)
+        .await
+        .wrap_err("failed to fetch slot0 via eth_call")?;
+
+    // Fetch via storage (cross-validation)
+    let slot0_storage = mev_sim::v3::slot0::fetch_slot0_via_storage(rpc_url, pool, args.block)
+        .await
+        .wrap_err("failed to fetch slot0 via eth_getStorageAt")?;
+
+    // Cross-validate
+    let methods_agree = slot0_call.sqrt_price_x96 == slot0_storage.sqrt_price_x96
+        && slot0_call.tick == slot0_storage.tick;
+
+    // Compute price (USDC per WETH = token0 per token1)
+    let price = mev_sim::v3::sqrt_price_x96_to_price(
+        slot0_call.sqrt_price_x96,
+        args.token0_decimals,
+        args.token1_decimals,
+        true, // price in token0 (USDC) per token1 (WETH)
+    );
+
+    // Output table
+    let mut table = Table::new();
+    table.load_preset(UTF8_BORDERS_ONLY);
+    table.set_header(vec!["Field", "Value"]);
+
+    table.add_row(vec!["Block", &format!("{}", args.block)]);
+    table.add_row(vec!["Pool", &format!("{pool:#x}")]);
+    table.add_row(vec![
+        "sqrtPriceX96",
+        &format!("{}", slot0_call.sqrt_price_x96),
+    ]);
+    table.add_row(vec!["tick", &format!("{}", slot0_call.tick)]);
+    table.add_row(vec!["Price (token0/token1)", &price.display]);
+    table.add_row(vec!["Source", "eth_call"]);
+
+    let validation_status = if methods_agree {
+        "PASS — eth_call matches eth_getStorageAt"
+    } else {
+        "FAIL — eth_call and eth_getStorageAt disagree!"
+    };
+    table.add_row(vec!["Cross-validation", validation_status]);
+
+    println!("\n{table}\n");
+
+    if !methods_agree {
+        tracing::warn!(
+            call_sqrt = %slot0_call.sqrt_price_x96,
+            storage_sqrt = %slot0_storage.sqrt_price_x96,
+            call_tick = slot0_call.tick,
+            storage_tick = slot0_storage.tick,
+            "slot0 cross-validation FAILED"
+        );
+    }
+
+    info!(
+        block = args.block,
+        pool = %format!("{pool:#x}"),
+        price = %price.display,
+        tick = slot0_call.tick,
+        cross_validated = methods_agree,
+        "v3-price command completed"
     );
 
     Ok(())

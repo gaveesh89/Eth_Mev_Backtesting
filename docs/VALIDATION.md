@@ -109,6 +109,61 @@ Set `MEV_INTRA_DUMP_BLOCK=<block_number>` to dump the first 30 timeline steps fo
 
 ---
 
+## V3 Extensibility — Uniswap V3 Price Reader
+
+**Status: PASS**
+
+Proof-of-concept V3 price reader demonstrating that the toolkit can extend beyond V2 pools. Reads `slot0()` from any Uniswap V3 pool and converts `sqrtPriceX96` to a human-readable price using **integer-only** math (no `f64` in the computation path).
+
+- **Two read methods**: `fetch_slot0_via_call()` (ABI-encoded `eth_call`) and `fetch_slot0_via_storage()` (raw `eth_getStorageAt` with bit extraction)
+- **Cross-validation**: CLI compares both methods and reports match/mismatch
+- **Overflow prevention**: Shifts `sqrtPriceX96 >> 32` before squaring to stay within U256 bounds
+- **Feature gate**: Runtime `MEV_ENABLE_V3=1` env var (off by default)
+- **Default pool**: WETH/USDC 0.3% (`0x8ad599c3A0ff1De082011EFDDc58f1908eb6e6D8`)
+
+### Files
+
+| File | Purpose |
+|------|---------|
+| `crates/mev-sim/src/v3/mod.rs` | Module root, re-exports, `require_v3_enabled()` |
+| `crates/mev-sim/src/v3/slot0.rs` | `Slot0Data` struct, both fetch methods, sign-extend helpers |
+| `crates/mev-sim/src/v3/price.rs` | `PriceResult`, `sqrt_price_x96_to_price()`, display formatting |
+| `crates/mev-sim/tests/v3_tests.rs` | Integration tests (offline + RPC-gated) |
+| `crates/mev-cli/src/main.rs` | `v3-price` CLI command |
+
+### Test results
+
+| Test | Result |
+|------|--------|
+| `test_sqrt_price_x96_to_price_known_value` | PASS — ~$2765 USDC/WETH (integer-only) |
+| `test_sqrt_price_inverse_relationship` | PASS — forward × inverse ≈ 1.0 |
+| `test_sqrt_price_zero` | PASS — returns zero price |
+| `test_sqrt_price_same_decimals` | PASS — equal-decimal tokens |
+| `test_format_price_display` | PASS — 8-decimal string formatting |
+| `test_format_price_display_small` | PASS — small values render correctly |
+| `test_sign_extend_i24_*` (5 tests) | PASS — positive, negative, zero, max, min |
+| `test_sign_extend_int256_*` (2 tests) | PASS — positive/negative int256 |
+| `test_trim_or_zero` | PASS — hex edge cases |
+| `test_sqrt_price_x96_to_price_known_values` (integration) | PASS — offline, ~$2765 |
+| `test_univ3_slot0_changes_across_blocks` (#[ignore]) | PASS with archive RPC |
+| `test_univ3_slot0_storage_equals_eth_call` (#[ignore]) | PASS with archive RPC |
+
+### Run commands
+
+```bash
+# Offline tests (no RPC needed):
+cargo nextest run -p mev-sim v3
+
+# RPC-gated tests (requires archive node):
+export MEV_RPC_URL="https://eth-mainnet.g.alchemy.com/v2/YOUR_KEY"
+cargo nextest run -p mev-sim v3 --run-ignored all
+
+# CLI usage:
+MEV_ENABLE_V3=1 cargo run -- v3-price --pool 0x8ad599c3A0ff1De082011EFDDc58f1908eb6e6D8 --block 18000000
+```
+
+---
+
 ## Instrumentation
 
 ```bash
